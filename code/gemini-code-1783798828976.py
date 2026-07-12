@@ -6,7 +6,7 @@ from sklearn.preprocessing import StandardScaler
 import numpy as np
 
 # Import your unmodified classifier and helper function from "dist comp times 0.py"
-from kmeans_custom import kmeans_parallel, reset_counters
+from kmeans_parallel import kmeans_parallel
 
 def calculate_inertia(X_bag, centroids):
     centroids_arr = np.vstack(centroids)
@@ -14,7 +14,7 @@ def calculate_inertia(X_bag, centroids):
 
 def main():
     print("Loading dataset...")
-    dataset = fetch_kddcup99(as_frame=True) 
+    dataset = fetch_kddcup99(as_frame=True, subset='SA', percent10=True) 
     df_numeric = dataset.data.select_dtypes(include=[np.number]).dropna().astype(float)
     X_numpy = StandardScaler().fit_transform(df_numeric.values)
     
@@ -48,8 +48,8 @@ def main():
                 client.close()
                 cluster.close()
             print(f"\n--- Starting Dask LocalCluster with {n_workers} workers ---")
-            cluster = LocalCluster(n_workers=n_workers, threads_per_worker=1)
-            client = Client(cluster)
+            #cluster = LocalCluster(n_workers=n_workers, threads_per_worker=1)
+            client = Client('dask-scheduler:8786')
             current_workers = n_workers
             current_partitions = None 
             
