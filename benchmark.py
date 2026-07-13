@@ -75,7 +75,7 @@ def run_single_test(client, X, k, l, r, num_partitions, max_iter_fit=10, seed=42
         "partitions": num_partitions,
         "cost": cost,
         "time": elapsed_time,
-    }, X_bag
+    }
 
 
 def run_benchmark(client, X, combinations, k_values, label="benchmark", max_iter_fit=10, seed=42):
@@ -128,7 +128,7 @@ def run_benchmark(client, X, combinations, k_values, label="benchmark", max_iter
             print(f"Testing: k={k}, workers={n_workers}, partitions={num_partitions}, "
                   f"l={l} (l/k={l_over_k}), r={r}")
 
-            result, X_bag = run_single_test(
+            result = run_single_test(
                 client, X, k=k, l=l, r=r,
                 num_partitions=num_partitions,
                 max_iter_fit=max_iter_fit, seed=seed,
