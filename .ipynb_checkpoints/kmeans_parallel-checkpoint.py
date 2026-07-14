@@ -17,9 +17,10 @@ Uso tipico (da notebook):
 
 import dask
 import dask.bag as db
+from dask.bag import random as dask_random
 from sklearn.cluster import KMeans
 import numpy as np
-from dask.bag import random as dbr
+
 
 class kmeans_parallel():
     """K-means con inizializzazione parallela (k-means||) su Dask."""
@@ -52,12 +53,14 @@ class kmeans_parallel():
         probabilità proporzionale alla distanza al quadrato dal centroide
         più vicino già scelto, poi li riduce a k centroidi finali con un
         k-means pesato (scikit-learn)."""
-
+        X = X.persist()
+        rng = np.random.default_rng(seed)
+        
         if seed is not None:
             np.random.seed(seed)
 
         # STEP 1: centroide iniziale casuale
-        initial_centroid = dbr.sample(X, 1).compute()[0]
+        initial_centroid = dask_random.sample(X, 1).compute()[0]        
         initial_centroid = np.asarray(initial_centroid).reshape(1, -1)
         self.centroids.append(initial_centroid)
 
@@ -68,15 +71,29 @@ class kmeans_parallel():
 
         # STEP 2: costo iniziale
         psi = state.map(lambda t: t[0]).sum().compute()
-
+        if psi == 0.0:
+            self.starting_centroids = np.vstack(self.centroids)
+            self.min_dists = state.map(lambda t: t[0])
+            return
+            
         # STEP 3: determina il numero di round
         if l is None:
             l = self.l
         if max_iter is None:
-            max_iter = self.r if self.r is not None else int(round(alpha * np.log(psi)))
+            ratio = (l if l is not None else self.l) / self.k
+            if ratio <= 0.1:
+                max_iter = 15 
+                # se l/k è piccolo,per piccoli valori di r rischiamo di avere meno di k valori, e il codice si interrompe
+            elif self.r is not None:
+                max_iter = self.r
+            else:
+                max_iter = int(round(alpha * np.log(psi)))
 
+        cost = psi
+        
         for _ in range(max_iter):
-            # costo corrente
+            if cost == 0.0: 
+                break
             cost = state.map(lambda t: t[0]).sum().compute()
 
             # probabilità di campionamento per ogni punto

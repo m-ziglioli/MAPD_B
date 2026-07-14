@@ -78,7 +78,7 @@ def run_single_test(client, X, k, l, r, num_partitions, max_iter_fit=10, seed=42
     }, X_bag
 
 
-def run_benchmark(client, X, combinations, k_values, label="benchmark", max_iter_fit=10, seed=42):
+def run_benchmark(client, X, combinations, k_values, label="benchmark", max_iter_fit=10, seed=42,averaging_iterations = 10):
     """
     Esegue una griglia di test e salva i risultati in un CSV timestampato
     dentro ./results.
@@ -102,7 +102,8 @@ def run_benchmark(client, X, combinations, k_values, label="benchmark", max_iter
         Numero massimo di iterazioni di Lloyd's per la fase di fit().
     seed : int
         Seed per la riproducibilità del campionamento.
-
+    averaging_iterations : int
+        Numero di iterazioni su cui effettuare la media
     Returns
     -------
     df_results : pd.DataFrame
@@ -125,17 +126,22 @@ def run_benchmark(client, X, combinations, k_values, label="benchmark", max_iter
                 current_partitions = num_partitions
 
             l = max(1, round(l_over_k * k))
+            if l/k <= 0.1:
+                r=15
+                
             print(f"Testing: k={k}, workers={n_workers}, partitions={num_partitions}, "
-                  f"l={l} (l/k={l_over_k}), r={r}")
+                  f"l={l} (l/k={l_over_k}), r={r}",f"\n Iterating {averaging_iterations} times.")
 
-            result, X_bag = run_single_test(
-                client, X, k=k, l=l, r=r,
-                num_partitions=num_partitions,
-                max_iter_fit=max_iter_fit, seed=seed,
-                X_bag=X_bag,
-            )
-            result.update({"workers": n_workers, "l_over_k": l_over_k})
-            results.append(result)
+            for i in range(averaging_iterations):
+                result, X_bag = run_single_test(
+                    client, X, k=k, l=l, r=r,
+                    num_partitions=num_partitions,
+                    max_iter_fit=max_iter_fit, seed=seed,
+                    X_bag=X_bag,
+                )
+                result["workers"] = n_workers
+                result["l_over_k"] = l_over_k
+                results.append(result)
 
     df_results = pd.DataFrame(results)
 
