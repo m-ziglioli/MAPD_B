@@ -39,7 +39,7 @@ def calculate_inertia(X_bag, centroids):
     return X_bag.map(lambda x: np.min(np.linalg.norm(x - centroids_arr, axis=1) ** 2)).sum().compute()
 
 
-def run_single_test(client, X, k, l, r, num_partitions, max_iter_fit=10, seed=42, X_bag=None):
+def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X=None, X_bag=None):
     """
     Esegue una singola run di k-means|| + Lloyd's fit su una combinazione
     di parametri, e ritorna un dict con i risultati.
