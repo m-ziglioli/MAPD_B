@@ -15,6 +15,8 @@ Uso tipico (da notebook):
     labels = clf.classify(X_bag)
 """
 
+import time
+
 import dask
 import dask.bag as db
 from dask.bag import random as dask_random
@@ -47,13 +49,21 @@ class kmeans_parallel():
 
     # --------------------------------------------------------------------
 
-    def compute_starting_centroids(self, X, alpha=1, l=None, max_iter=None, seed=None):
+    def compute_starting_centroids(self, X, alpha=1, l=None, max_iter=None, seed=None, track_centroids=False):
         """Inizializzazione k-means|| parallela: seleziona un pool di
         candidati centroidi campionando iterativamente da X con
         probabilità proporzionale alla distanza al quadrato dal centroide
         più vicino già scelto, poi li riduce a k centroidi finali con un
-        k-means pesato (scikit-learn)."""
+        k-means pesato (scikit-learn).
+
+        Se track_centroids=True, salva in self.n_centroids_history_ il
+        numero cumulativo di candidati centroidi dopo ogni round eseguito,
+        utile per ispezionare la crescita del pool di candidati.
+        """
         X = X.persist()
+
+        if track_centroids:
+            self.n_centroids_history_ = []
         rng = np.random.default_rng(seed)
         
         if seed is not None:
@@ -106,28 +116,29 @@ class kmeans_parallel():
                       .map(lambda t: t[0])
             ).compute()
 
-            if not sample:
-                continue
+            if sample:
+                start_idx = len(self.centroids)
+                new_centroids_arr = np.vstack([np.asarray(s).reshape(1, -1) for s in sample])
 
-            start_idx = len(self.centroids)
-            new_centroids_arr = np.vstack([np.asarray(s).reshape(1, -1) for s in sample])
+                for s in sample:
+                    self.centroids.append(np.asarray(s).reshape(1, -1))
 
-            for s in sample:
-                self.centroids.append(np.asarray(s).reshape(1, -1))
+                def update_state(pack, new_arr=new_centroids_arr, s_idx=start_idx):
+                    x, (curr_min_dist, curr_idx) = pack
+                    dists_to_new = np.linalg.norm(x - new_arr, axis=1) ** 2
+                    min_new_idx_relative = int(np.argmin(dists_to_new))
+                    min_new_dist = dists_to_new[min_new_idx_relative]
 
-            def update_state(pack, new_arr=new_centroids_arr, s_idx=start_idx):
-                x, (curr_min_dist, curr_idx) = pack
-                dists_to_new = np.linalg.norm(x - new_arr, axis=1) ** 2
-                min_new_idx_relative = int(np.argmin(dists_to_new))
-                min_new_dist = dists_to_new[min_new_idx_relative]
+                    if min_new_dist < curr_min_dist:
+                        return (min_new_dist, s_idx + min_new_idx_relative)
+                    else:
+                        return (curr_min_dist, curr_idx)
 
-                if min_new_dist < curr_min_dist:
-                    return (min_new_dist, s_idx + min_new_idx_relative)
-                else:
-                    return (curr_min_dist, curr_idx)
+                state = db.zip(X, state).map(update_state)
+                state = dask.persist(state)[0]
 
-            state = db.zip(X, state).map(update_state)
-            state = dask.persist(state)[0]
+            if track_centroids:
+                self.n_centroids_history_.append(len(self.centroids))
 
         # STEP 7: pesi = numero di punti assegnati a ciascun candidato centroide
         counts = state.map(lambda t: t[1]).frequencies().compute()
@@ -139,7 +150,9 @@ class kmeans_parallel():
         centroids_weights = weights
 
         # STEP 8: riduzione finale a k centroidi con k-means pesato (scikit-learn)
-        kmeans = KMeans(n_clusters=self.k)
+        # n_init=1: il paper (Bahmani et al.) usa una singola inizializzazione
+        # k-means++ per il reclustering, non i 10 restart di default di sklearn
+        kmeans = KMeans(n_clusters=self.k, n_init=1)
         kmeans.fit(np.vstack(self.centroids), sample_weight=centroids_weights)
         self.starting_centroids = kmeans.cluster_centers_
 
@@ -147,30 +160,84 @@ class kmeans_parallel():
 
     # --------------------------------------------------------------------
 
-    def fit(self, X, max_iter=100, tol=1e-4):
+    def fit(self, X, max_iter=100, tol=1e-4, track_convergence=False):
         """Standard Lloyd's K-means, a partire dai centroidi calcolati da
-        compute_starting_centroids, eseguito in modo distribuito su X."""
+        compute_starting_centroids, eseguito in modo distribuito su X.
+
+        Se track_convergence=True, salva in self.cost_history_ l'inertia
+        (rispetto ai centroidi usati per l'assegnazione) e in
+        self.iter_times_ il tempo impiegato ad ogni iterazione di Lloyd's,
+        utile per ispezionare la convergenza. Il costo viene ricavato dallo
+        stesso foldby usato per aggiornare i centroidi, senza un secondo
+        giro sui dati.
+        """
 
         centroids_arr = np.vstack(self.starting_centroids)
 
+        if track_convergence:
+            self.cost_history_ = []
+            self.iter_times_ = []
+
         for _ in range(max_iter):
-            mapped = X.map(lambda x: (int(np.argmin(np.linalg.norm(x - centroids_arr, axis=1))), np.array(x)))
+            iter_start = time.time()
 
-            def binop(acc, item):
-                total, count = acc
-                return (total + item[1], count + 1)
+            if track_convergence:
+                def assign(x, c=centroids_arr):
+                    d2 = np.linalg.norm(x - c, axis=1) ** 2
+                    idx = int(np.argmin(d2))
+                    return (idx, (np.array(x), d2[idx]))
 
-            def combine(acc1, acc2):
-                return (acc1[0] + acc2[0], acc1[1] + acc2[1])
+                mapped = X.map(assign)
 
-            sums_counts = mapped.foldby(lambda t: t[0], binop, (0.0, 0), combine, (0.0, 0)).compute()
-            reduced = {idx: total / count for idx, (total, count) in sums_counts}
+                def binop(acc, item):
+                    total, count, cost = acc
+                    x, d2 = item[1]
+                    return (total + x, count + 1, cost + d2)
+
+                def combine(acc1, acc2):
+                    return (acc1[0] + acc2[0], acc1[1] + acc2[1], acc1[2] + acc2[2])
+
+                sums_counts = mapped.foldby(lambda t: t[0], binop, (0.0, 0, 0.0), combine, (0.0, 0, 0.0)).compute()
+                reduced = {idx: total / count for idx, (total, count, _) in sums_counts}
+                iter_cost = sum(cost for _, (_, _, cost) in sums_counts)
+
+                self.cost_history_.append(iter_cost)
+            else:
+                mapped = X.map(lambda x: (int(np.argmin(np.linalg.norm(x - centroids_arr, axis=1))), np.array(x)))
+
+                def binop(acc, item):
+                    total, count = acc
+                    return (total + item[1], count + 1)
+
+                def combine(acc1, acc2):
+                    return (acc1[0] + acc2[0], acc1[1] + acc2[1])
+
+                sums_counts = mapped.foldby(lambda t: t[0], binop, (0.0, 0), combine, (0.0, 0)).compute()
+                reduced = {idx: total / count for idx, (total, count) in sums_counts}
 
             new_centroids = np.copy(centroids_arr)
             for cluster_idx, p_mean in reduced.items():
                 new_centroids[cluster_idx] = p_mean
 
             self.final_centroids = new_centroids
+
+            if track_convergence:
+                self.iter_times_.append(time.time() - iter_start)
+
+            # Strict convergence: stop as soon as no point changes cluster,
+            # like sklearn does. The raw centroid-shift check below almost
+            # never triggers once k is in the hundreds (its threshold does
+            # not scale with k), so without this check fit() runs until
+            # max_iter even when the assignment has long been stable.
+            any_label_changed = X.map(
+                lambda x, c_old=centroids_arr, c_new=new_centroids: (
+                    int(np.argmin(np.linalg.norm(x - c_old, axis=1)))
+                    != int(np.argmin(np.linalg.norm(x - c_new, axis=1)))
+                )
+            ).any().compute()
+
+            if not any_label_changed:
+                break
 
             if np.linalg.norm(new_centroids - centroids_arr) < tol:
                 break
