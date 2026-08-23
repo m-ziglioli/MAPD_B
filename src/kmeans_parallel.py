@@ -153,6 +153,48 @@ def _sample_round(M, state, l, cost, round_seed_seq):
     return M[mask]
 
 
+def _sample_round_exact(M, state, l, round_seed_seq):
+    """Campionamento ESATTO di l punti per round, senza reimmissione, con
+    probabilita' proporzionale a d^2(x, C) — protocollo della Fig 5.1 del
+    paper (Bahmani et al. usano questa variante SOLO per la Fig 5.1).
+
+    Schema Efraimidis-Spirakis (weighted sampling without replacement):
+    chiave u^(1/w) con u~U(0,1), w = d^2; i top-l LOCALI di ogni partizione,
+    uniti, contengono il top-l GLOBALE (proprieta' del massimo: top-l di un
+   'unione = unione dei top-l). Cosi' attraverso il confine client/cluster
+    passano solo l coppie (chiave, indice) per partizione, mai i punti.
+
+    Punti a distanza zero hanno peso nullo e non sono mai campionabili
+    (coerente con il Bernoulli, dove p = min(1, l*d2/cost) = 0).
+
+    Ritorna (keys (t,), local_indices (t,) int64): le chiavi servono al
+    merge globale sul client, gli indici al recupero delle righe scelte.
+    """
+    if M.shape[0] == 0:
+        return np.empty(0), np.empty(0, dtype=np.int64)
+    rng = np.random.default_rng(round_seed_seq)
+    u = rng.random(M.shape[0])
+    w = state[:, 0].astype(np.float64)
+    nz = w > 0.0
+    # chiave -inf => punto non campionabile (peso nullo). Forma potenza
+    # (non exp/log): u=0 esatto non genera warning e da' chiave 0.
+    keys = np.full(M.shape[0], -np.inf)
+    keys[nz] = u[nz] ** (1.0 / w[nz])
+    l_loc = int(min(l, nz.sum()))
+    if l_loc <= 0:
+        return np.empty(0), np.empty(0, dtype=np.int64)
+    top = np.argsort(keys)[-l_loc:]
+    return keys[top], top.astype(np.int64)
+
+
+def _rows_at(M, idx):
+    """Righe di una partizione agli indici locali ``idx`` (fancy indexing);
+    usato sia dal percorso r=0 sia dal recupero dei campioni esatti."""
+    if len(idx) == 0:
+        return np.empty((0, M.shape[1] if M.ndim == 2 else 0))
+    return M[idx]
+
+
 def _update_state(M, state, new_centroids, start_idx):
     """Aggiorna lo stato (d^2 min, indice centroide) dopo aver aggiunto i
     candidati ``new_centroids`` (t, d) che partono dall'indice start_idx.
@@ -191,7 +233,9 @@ def resolve_rounds(l, k, r=None, alpha=1.0, psi=None, policy="auto"):
       - senza ``r`` si stima con round(alpha * log(psi)).
 
     policy="fixed" usa sempre ed esclusivamente ``r`` (obbligatorio):
-    escape hatch esplicito per bypassare la regola del paper.
+    escape hatch esplicito per bypassare la regola del paper. Con r=0 il
+    chiamante (compute_starting_centroids) ottiene la modalita' "random
+    baseline": k centri uniformi senza round ne' reclustering.
 
     Nota: la regola l/k<=0.1 -> 15 e' volutamente mantenuta anche quando
     ``r`` e' fornito (comportamento storico del progetto); i driver
@@ -204,11 +248,15 @@ def resolve_rounds(l, k, r=None, alpha=1.0, psi=None, policy="auto"):
     if policy == "fixed":
         if r is None:
             raise ValueError("policy='fixed' richiede un numero di round r esplicito")
+        if int(r) < 0:
+            raise ValueError("r non puo' essere negativo")
         return int(r)
     # policy == "auto"
     if l / k <= 0.1:
         return 15
     if r is not None:
+        if int(r) < 0:
+            raise ValueError("r non puo' essere negativo")
         return int(r)
     if psi is None or psi <= 0:
         raise ValueError("senza r esplicito serve psi > 0 per stimare i round")
@@ -269,10 +317,11 @@ class kmeans_parallel():
         self.final_centroids = None     # impostato da fit
         self.n_iter_ = None    # iterazioni di Lloyd's eseguite da fit()
         self.n_rounds_ = None  # round k-means|| effettivamente eseguiti
+        self.sampling_ = None  # schema di campionamento usato dal seeding
 
     # --------------------------------------------------------------------
 
-    def compute_starting_centroids(self, X, alpha=1, l=None, max_iter=None, seed=None, track_centroids=False, policy="auto"):
+    def compute_starting_centroids(self, X, alpha=1, l=None, max_iter=None, seed=None, track_centroids=False, policy="auto", sampling="bernoulli"):
         """Inizializzazione k-means|| parallela: seleziona un pool di
         candidati centroidi campionando iterativamente da X con
         probabilita' proporzionale alla distanza al quadrato dal centroide
@@ -283,6 +332,17 @@ class kmeans_parallel():
         regola del paper) oppure preso com'e' con policy="fixed"; il valore
         effettivamente eseguito resta in ``self.n_rounds_``.
 
+        Con policy="fixed" e r=0: modalita' RANDOM BASELINE — k centri
+        uniformi senza round ne' reclustering (punto r=0 dell'asse in
+        Fig 5.2 del paper; e' anche il baseline Random di Table 3).
+
+        sampling:
+          - "bernoulli" (default): Algorithm 2 del paper — ogni punto
+            campionato con probabilita' min(1, l*d2/cost);
+          - "exact": ESATTAMENTE l punti per round senza reimmissione,
+            probabilita' proporzionale a d^2 (protocollo della sola
+            Fig 5.1; schema Efraimidis-Spirakis distribuito).
+
         Se track_centroids=True, salva in self.n_centroids_history_ il
         numero cumulativo di candidati centroidi dopo ogni round eseguito,
         utile per ispezionare la crescita del pool di candidati.
@@ -290,6 +350,12 @@ class kmeans_parallel():
         Deterministico dato ``seed``: le estrazioni usano SeedSequence(seed)
         e un RNG per (partizione, round), non il RNG globale di NumPy.
         """
+        if sampling not in ("bernoulli", "exact"):
+            raise ValueError("sampling deve essere 'bernoulli' o 'exact'")
+        if l is None:
+            l = self.l
+        self.sampling_ = sampling
+
         parts = _persist_matrices(X)
         shapes = dask.compute(*[dask.delayed(_matrix_shape, pure=True)(p) for p in parts])
         n_points = int(sum(s[0] for s in shapes))
@@ -299,11 +365,33 @@ class kmeans_parallel():
 
         # SeedSequence padre: entropia deterministica se seed e' fornito,
         # casuale altrimenti. Da qui derivano TUTTE le estrazioni, su tre
-        # rami figli INDIPENDENTI (spawn): centroide iniziale, round di
-        # campionamento, reclustering pesato. Usare la stessa sequenza per
-        # piu' Generator duplicherebbe lo stesso stream (estrazioni
-        # correlate): ogni consumo ha il suo ramo.
+        # rami figli INDIPENDENTI (spawn): centroide iniziale / indici
+        # random-baseline, round di campionamento, reclustering pesato.
+        # Usare la stessa sequenza per piu' Generator duplicherebbe lo
+        # stesso stream (estrazioni correlate): ogni consumo ha il suo ramo.
         ss_init, ss_body, ss_reclust = np.random.SeedSequence(seed).spawn(3)
+
+        # STEP 0: con policy="fixed" il numero di round non dipende dai dati
+        # (psi non serve): si puo' cortocircuitare PRIMA di toccare X.
+        # r=0 => RANDOM BASELINE: k indici uniformi senza reimmissione.
+        r_request = self.r if max_iter is None else max_iter
+        n_rounds_fixed = (
+            resolve_rounds(l=l, k=self.k, r=r_request, alpha=alpha, psi=None, policy="fixed")
+            if policy == "fixed" else None
+        )
+        if n_rounds_fixed == 0:
+            rng0 = np.random.default_rng(ss_init)
+            global_idx = np.sort(rng0.choice(n_points, size=self.k, replace=False))
+            offsets = np.cumsum([0] + [int(s[0]) for s in shapes])
+            fetch_tasks = []
+            for j, p in enumerate(parts):
+                loc = global_idx[(global_idx >= offsets[j]) & (global_idx < offsets[j + 1])]
+                fetch_tasks.append(dask.delayed(_rows_at)(p, loc - offsets[j]))
+            C = np.vstack(dask.compute(*fetch_tasks))
+            self.centroids = [C]
+            self.starting_centroids = C
+            self.n_rounds_ = 0
+            return
 
         # STEP 1: centroide iniziale casuale (uniforme su tutti i punti,
         # via indice estratto dal RNG dedicato)
@@ -347,13 +435,12 @@ class kmeans_parallel():
             return
 
         # STEP 3: numero di round, risolto in un unico punto (resolve_rounds)
-        if l is None:
-            l = self.l
-        n_rounds = resolve_rounds(
-            l=l, k=self.k,
-            r=self.r if max_iter is None else max_iter,
-            alpha=alpha, psi=psi, policy=policy,
-        )
+        if policy == "fixed":
+            n_rounds = n_rounds_fixed  # gia' noto dallo STEP 0 (> 0 qui)
+        else:
+            n_rounds = resolve_rounds(
+                l=l, k=self.k, r=r_request, alpha=alpha, psi=psi, policy="auto"
+            )
 
         # chiavi RNG figlie, una per partizione: indipendenti per costruzione.
         # I seed per (partizione, round) sono pre-derivati in blocco con
@@ -369,15 +456,47 @@ class kmeans_parallel():
                 break
             rounds_run += 1
 
-            # probabilità di campionamento per ogni punto (vettore per partizione)
-            sample_tasks = [
-                dask.delayed(_sample_round, pure=False)(
-                    p, s, l, cost, round_seeds[j][round_idx]
+            if sampling == "exact":
+                # top-l LOCALI per partizione (chiavi Efraimidis-Spirakis):
+                # solo l coppie (chiave, indice) per partizione attraversano
+                # la rete, i punti restano sui worker.
+                key_tasks = [
+                    dask.delayed(_sample_round_exact, pure=False)(
+                        p, s, l, round_seeds[j][round_idx]
+                    )
+                    for j, (p, s) in enumerate(zip(parts, state_delays))
+                ]
+                key_parts = dask.compute(*key_tasks)
+                all_keys = np.concatenate([kp[0] for kp in key_parts])
+                part_ids = np.concatenate(
+                    [np.full(len(kp[0]), j, dtype=np.int64) for j, kp in enumerate(key_parts)]
                 )
-                for j, (p, s) in enumerate(zip(parts, state_delays))
-            ]
-            sampled_parts = dask.compute(*sample_tasks)
-            sampled = [s for s in sampled_parts if s.shape[0] > 0]
+                local_ids = np.concatenate([kp[1] for kp in key_parts])
+
+                # merge globale -> top-l (o meno se l'intero dataset ha
+                # meno punti a peso positivo di l)
+                order = np.argsort(all_keys)[::-1][:l]
+                sel_part = part_ids[order]
+                sel_loc = local_ids[order]
+
+                # recupero delle sole righe scelte, una task per partizione
+                fetch_tasks = []
+                for j, p in enumerate(parts):
+                    loc = np.sort(sel_loc[sel_part == j])
+                    fetch_tasks.append(dask.delayed(_rows_at)(p, loc))
+                fetched = dask.compute(*fetch_tasks)
+                sampled = [f for f in fetched if f.shape[0] > 0]
+            else:
+                # probabilità di campionamento per ogni punto (vettore per
+                # partizione), Algorithm 2 del paper
+                sample_tasks = [
+                    dask.delayed(_sample_round, pure=False)(
+                        p, s, l, cost, round_seeds[j][round_idx]
+                    )
+                    for j, (p, s) in enumerate(zip(parts, state_delays))
+                ]
+                sampled_parts = dask.compute(*sample_tasks)
+                sampled = [s for s in sampled_parts if s.shape[0] > 0]
 
             if sampled:
                 new_centroids_arr = np.vstack(sampled)
