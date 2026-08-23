@@ -7,6 +7,8 @@
 - confronto con k-means standard nel dataset 100%
 - questione unmanaged memory
 - ricontrollare bene code
+- POSTPONATO: riproduzione articolo (Tabelle 3/4, Fig 5.1/5.2) — piano
+  completo e decisioni in docs/ANALYSIS_PLAN.md
 - sistemare la criticità dei calcoli punto-per-punto con bag.map(lambda ...) in
   fit()/compute_starting_centroids (vettorizzare per partizione con
   map_partitions, es. sklearn.metrics.pairwise.euclidean_distances)
