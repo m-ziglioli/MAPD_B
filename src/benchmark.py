@@ -21,7 +21,11 @@ import dask.bag as db
 import numpy as np
 import pandas as pd
 
-from src.kmeans_parallel import kmeans_parallel
+from src.kmeans_parallel import (
+    _bag_to_matrices,
+    _inertia_partial,
+    kmeans_parallel,
+)
 
 RESULTS_DIR = "results"
 
@@ -35,8 +39,14 @@ def _build_bag(client, X, num_partitions):
 
 
 def calculate_inertia(X_bag, centroids):
+    """Inertia (somma delle d^2 al centroide piu' vicino) calcolata con un
+    task vettorizzato per partizione: nessuna lambda punto-per-punto."""
     centroids_arr = np.vstack(centroids)
-    return X_bag.map(lambda x: np.min(np.linalg.norm(x - centroids_arr, axis=1) ** 2)).sum().compute()
+    partials = dask.compute(
+        *[dask.delayed(_inertia_partial, pure=False)(p, centroids_arr)
+          for p in _bag_to_matrices(X_bag)]
+    )
+    return float(sum(partials))
 
 
 def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X=None, X_bag=None,
