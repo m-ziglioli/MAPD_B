@@ -15,6 +15,13 @@
 - [ ] questione unmanaged memory
 - [ ] VALIDAZIONE SU CLUSTER del refactor stato-distribuito (2026-08-23):
   sweep piccolo k=500/1000, 4 combinazioni del notebook, confronto
-  tempi/costi con i CSV storici in results/
-- [ ] POSTPONATO: riproduzione articolo (Tabelle 3/4/6, Fig 5.1/5.2) —
-  piano completo e decisioni in docs/ANALYSIS_PLAN.md
+  tempi/costi con i CSV storici in results/ — runbook: agents/vm_checklist.md
+- [x] prerequisiti riproduzione articolo implementati in locale
+  (CHANGES 2026-08-23 fase A: r=0 random baseline, sampling="exact",
+  GaussMixture, src/paper_experiments.py, notebook flag-gated)
+- [ ] ESECUZIONE articolo su cluster (ANALYSIS_PLAN sessioni A/B): Fig 5.1,
+  Tables 3/4 (+sanity check), Fig 5.2 locale; poi write-up obtained-vs-paper
+- [ ] FASE D (out-of-core): shard Parquet per worker invece di repliche,
+  repartitioning nel grafo senza materializzazione client, validazione
+  costi identici su KDD 10%
+- [ ] POSTPONATO→IN CORSO: voci sopra (il piano resta in docs/ANALYSIS_PLAN.md)

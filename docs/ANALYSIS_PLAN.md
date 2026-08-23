@@ -1,8 +1,12 @@
 # Analysis plan — reproduction of Bahmani et al. (2012)
 
-**Status: POSTPONED** (frozen 2026-08-23, before the performance refactor).
-This document preserves every decision taken during planning so the analysis
-can resume without re-deriving anything. Reference paper:
+**Status: PREREQUISITES IMPLEMENTED, EXECUTION PENDING** (2026-08-23).
+All "Code prerequisites" below are done and locally validated
+(`src/paper_experiments.py`, `sampling="exact"`, r=0 random baseline,
+`make_gauss_mixture`/`array_to_bag`, `notebooks/paper_reproduction.ipynb`;
+see CHANGES.md). What remains are the cluster sessions in "Execution
+phases" (after B0 checklist + B1 validation) and the out-of-core item in
+"Deferred separately". Original decisions preserved below. Reference paper:
 `docs/1203.6402v1.pdf` (arXiv 1203.6402, "Scalable K-MEANS++").
 
 ## Scope

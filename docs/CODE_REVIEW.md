@@ -197,25 +197,15 @@ Reference: `docs/1203.6402v1.pdf`. Partition baseline excluded per plan.
 
 | Artifact | Paper protocol | Status in repo |
 |---|---|---|
-| Table 3 (KDD full cost) | k in {500,1000}, r=5, l in {0.1k,0.5k,k,2k,10k} + Random; cost x1e-10; median protocol | Covered by `run_comparison`-style sweep on full KDD; needs cluster run |
-| Table 4 (times) | init + Lloyd time per method (Hadoop) | Adapted: same table structure measured on our Dask cluster (not comparable to paper's absolute numbers) |
-| Table 6 (Lloyd iterations, Spam) | k in {20,50,100}; Random / k-means++ / k-means||(0.5k,5) / (2k,5); avg over 10 runs | **Missing**: Spam dataset loader; iteration count exposed (`n_iter_`, plus `n_rounds_` for seeding rounds) |
-| Fig 5.1 (cost vs rounds, KDD 10%) | k in {17,33,65,129}, l/k in {1,2,4}, r = 1..10, **exactly l samples per round** (joint distribution), median of 11 runs | **Missing**: exact-l sampling mode (we only have Bernoulli) |
-| Fig 5.2 (cost vs rounds, GaussMixture) | n=10k, 15-dim, R in {1,10,100}, l/k in {0.1,..,10}, r = 0..15, k-means++ horizontal reference | **Missing**: GaussMixture generator; r=0 must degrade to uniform random k centers |
+| Table 3 (KDD full cost) | k in {500,1000}, r=5, l in {0.1k,0.5k,k,2k,10k} + Random; cost x1e-10; median protocol | **Driver ready**: `paper_experiments.run_table34` (policy="fixed" r=5 — the auto rule must NOT apply here; Random via r=0 path); needs cluster session |
+| Table 4 (times) | init + Lloyd time per method (Hadoop) | **Driver ready**: same run records `time_seed`/`time_fit`; `table34_time_table` pivots them. Adapted: same table structure measured on our Dask cluster (not comparable to paper's absolute numbers) |
+| Table 6 (Lloyd iterations, Spam) | k in {20,50,100}; Random / k-means++ / k-means||(0.5k,5) / (2k,5); avg over 10 runs | **OUT OF SCOPE** per user decision (ANALYSIS_PLAN): no Spam loader |
+| Fig 5.1 (cost vs rounds, KDD 10%) | k in {17,33,65,129}, l/k in {1,2,4}, r = 1..10, **exactly l samples per round** (joint distribution), median of 11 runs | **Driver ready**: `run_fig51` with `sampling="exact"` (distributed Efraimidis–Spirakis); needs cluster session |
+| Fig 5.2 (cost vs rounds, GaussMixture) | n=10k, 15-dim, R in {1,10,100}, l/k in {0.1,..,10}, r = 0..15, k-means++ horizontal reference | **Driver ready, local-runnable**: `run_fig52` + `make_gauss_mixture`; r=0 degrades to uniform random k centers as required |
 
-New work required:
+New work status (from the original gap list):
 
-1. `src/data_loader.py`: `make_gauss_mixture(n, k, d=15, R)` and
-   `load_spam()` (UCI spambase, 4601 x 57 + label).
-2. `src/kmeans_parallel.py`:
-   - `sampling="bernoulli" | "exact"` in `compute_starting_centroids`
-     (exact = sample exactly `l` points per round without replacement,
-     proportional to d2/phi, as in the Fig 5.1 protocol);
-   - expose `n_iter_` (iterations executed by `fit`) for Table 6;
-   - `r=0` handling: uniform random k centers (Random baseline) so the
-     Fig 5.2 x-axis starts at 0.
-3. `src/paper_experiments.py`: sweep drivers producing one CSV per
-   artifact under `results/`, and plotting functions for Fig 5.1/5.2
-   (log-y, median curves) into `figures/`.
-4. `notebooks/paper_reproduction.ipynb`: one section per artifact;
-   GaussMixture/Spam sections run locally, KDD sections need the cluster.
+1. ~~`make_gauss_mission` / Spam loader~~ — GaussMixture DONE (`data_loader.make_gauss_mixture`, `array_to_bag`); Spam dropped by scope decision.
+2. ~~sampling modes / r=0 / iteration count~~ — ALL DONE (`sampling="bernoulli"|"exact"`, r=0 random baseline under policy="fixed", `n_iter_` + `n_rounds_`).
+3. ~~sweep drivers + plotting~~ — DONE (`src/paper_experiments.py`: run_fig51/fig52/table34, plot_fig51/fig52, table34_cost/time tables; known pool<k failures handled benignly for overnight robustness).
+4. Notebook skeleton DONE (`notebooks/paper_reproduction.ipynb`, flag-gated sections). Remaining: EXECUTION on the SSH cluster (sessions A/B of ANALYSIS_PLAN) after B0/B1 validation passes.

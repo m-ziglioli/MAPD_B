@@ -1,5 +1,72 @@
 # Changelog
 
+## 2026-08-23 — Fase A (prerequisiti articolo): random baseline r=0, sampling esatto, driver paper
+
+Prerequisiti del piano congelato `docs/ANALYSIS_PLAN.md`, implementati e
+validati in locale (commit `78b0b21`, `9ba80f1`, `b3cd268`). Esecuzione su
+cluster rimandata alle sessioni B/C.
+
+### `kmeans_parallel`
+- **r=0 → random baseline** (`policy="fixed"`): cortocircuito PRIMA di
+  toccare i dati — k righe uniformi di X (ramo `ss_init`), niente round né
+  reclustering, `n_rounds_=0`. È il punto r=0 della Fig 5.2 e il baseline
+  Random della Table 3. `resolve_rounds` rifiuta ora r negativi.
+- **`sampling="exact"`** (default resta `"bernoulli"` = Algorithm 2):
+  ESATTAMENTE l punti per round senza reimmissione con probabilità ∝ d²
+  (protocollo della sola Fig 5.1). Schema Efraimidis-Spirakis distribuito:
+  ogni partizione restituisce solo il proprio top-l (chiave u^(1/d²),
+  indice locale); il client fa il merge globale e una task per partizione
+  recupera le sole righe scelte. Punti a d²=0 mai campionabili. Stesso
+  schema RNG per (partizione, round) ⇒ determinismo preservato.
+- Nuovo attributo `sampling_`.
+
+### `data_loader`
+- `make_gauss_mixture(n, k, d, R, seed)` (dataset Fig 5.2) e
+  `array_to_bag(X, n_partitions)` (numpy → Bag di righe, formato identico
+  a load_dataset).
+
+### `paper_experiments` (nuovo modulo) + notebook
+- `run_fig51` (KDD 10%, exact-ℓ), `run_fig52` (GaussMixture, r da 0,
+  riferimento k-means++, girabile in locale), `run_table34` (KDD full).
+- **Protocollo tabelle**: `policy="fixed", r=5` — la regola automatica
+  l/k≤0.1→15 NON è quella delle tabelle dell'articolo (che usa r=5 anche a
+  ℓ/k=0.1). Il baseline Random è il percorso r=0.
+- **Robustezza notturna**: tutte le run passano da `_run_one_parallel`,
+  che tratta il caso noto "pool candidati < k" come benigno (riga con
+  failed=True e costi NaN, la sweep continua). Su griglie sintetiche
+  compatte l/k=0.1 cade SISTEMATICAMENTE sotto k (pool ~0.5k+1); su KDD
+  reale la coda pesata di d² fa campionare ≫ l al primo round (per questo
+  la tabella del paper esiste) — verificare col sanity check previsto nel
+  notebook prima della corsa completa.
+- Plot con convenzioni articolo (mediane, log-y): `plot_fig51`,
+  `plot_fig52`; tabelle `table34_cost_table` (×10⁻¹⁰, riusa
+  `format_paper_table`) e `table34_time_table`.
+- `notebooks/paper_reproduction.ipynb`: sezioni flag-gated (tiny/full
+  Fig5.2 locale; sanity-run poi sweep piena su cluster), path VM identici
+  agli altri notebook, scheletro obtained-vs-paper.
+
+### `benchmark`
+- `run_benchmark(..., X_arr=None)`: salta il gather-from-bag quando il
+  client ha già l'array; chiamate storiche invariate (verificate
+  bit-identiche sui costi).
+- `run_worker_sweep(X_arr, workers_list, combinations_fn, ...)`: riavvia il
+  cluster SSH per ogni conteggio di worker ed esegue la griglia — executor
+  del todo "worker e partizioni in simultanea"; un array client-side solo
+  per tutta la sweep, CSV per conteggio con suffisso `_w{n}` e colonna
+  `workers_cfg`.
+
+### Verifica e note operative
+- smoke_test esteso (r=0 righe-esatte+determinismo+fit; exact +l/round;
+  entrambi deterministici) — verde, golden regression intatta.
+- Driver validati end-to-end su griglie ridotte locali (fig51/fig52/
+  table34 incl. boundary l/k=0.1).
+- **Windows/LocalCluster**: ogni script che crea un LocalCluster DEVE stare
+  sotto `if __name__ == "__main__":` (spawn = re-import del modulo);
+  senza guardia si va in ricorsione di processi e hang silenziosi. I
+  notebook non sono interessati.
+- Harness locale: `agents/vm_checklist.md` (read-only) per la fase B0 sul
+  head VM (repo/env/ssh-workers/RAM/dataset/porte).
+
 ## 2026-08-23 — Review round 2: media reale sui seed, policy dei round esplicita, stato distribuito
 
 Secondo giro di review critica (post-refactor vettorizzato). Tre difetti
