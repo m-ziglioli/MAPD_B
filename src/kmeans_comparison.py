@@ -108,6 +108,7 @@ def run_comparison(client, X_bag, k_values, parallel_combinations, seed=42,
                 rows.append({
                     "method": "kmeans||",
                     "k": k, "l": l, "r": r,
+                    "r_effective": clf.n_rounds_,
                     "partitions": num_partitions, "l_over_k": l_over_k,
                     "seed": run_seed,
                     "cost_seed": calculate_inertia(current_bag, clf.starting_centroids),
@@ -129,7 +130,7 @@ def run_comparison(client, X_bag, k_values, parallel_combinations, seed=42,
 
                 rows.append({
                     "method": init,
-                    "k": k, "l": np.nan, "r": np.nan,
+                    "k": k, "l": np.nan, "r": np.nan, "r_effective": np.nan,
                     "partitions": np.nan, "l_over_k": np.nan,
                     "seed": run_seed,
                     "cost_seed": calculate_inertia(current_bag, clf.starting_centroids),

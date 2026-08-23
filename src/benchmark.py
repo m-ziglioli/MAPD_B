@@ -15,17 +15,14 @@ Due modalità d'uso, entrambe pensate per essere chiamate dal notebook:
 
 import os
 import time
+import traceback
 
 import dask
 import dask.bag as db
 import numpy as np
 import pandas as pd
 
-from src.kmeans_parallel import (
-    _bag_to_matrices,
-    _inertia_partial,
-    kmeans_parallel,
-)
+from src.kmeans_parallel import inertia_of_bag, kmeans_parallel
 
 RESULTS_DIR = "results"
 
@@ -40,13 +37,10 @@ def _build_bag(client, X, num_partitions):
 
 def calculate_inertia(X_bag, centroids):
     """Inertia (somma delle d^2 al centroide piu' vicino) calcolata con un
-    task vettorizzato per partizione: nessuna lambda punto-per-punto."""
-    centroids_arr = np.vstack(centroids)
-    partials = dask.compute(
-        *[dask.delayed(_inertia_partial, pure=False)(p, centroids_arr)
-          for p in _bag_to_matrices(X_bag)]
-    )
-    return float(sum(partials))
+    task vettorizzato per partizione. Delega all'implementazione condivisa
+    in src.kmeans_parallel.inertia_of_bag (stesso identico calcolo usato
+    dal metodo .inertia() della classe)."""
+    return inertia_of_bag(X_bag, centroids)
 
 
 def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X=None, X_bag=None,
@@ -73,32 +67,54 @@ def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X
     clf = kmeans_parallel(k=k, l=l, r=r)
     cost_history, iter_times, n_centroids_history = None, None, None
 
+    start_time = time.time()
     try:
-        start_time = time.time()
         clf.compute_starting_centroids(X_bag, seed=seed, track_centroids=track_centroids)
-        clf.fit(X_bag, max_iter=max_iter_fit, track_convergence=track_convergence)
-        elapsed_time = time.time() - start_time
-
-        cost = calculate_inertia(X_bag, clf.final_centroids)
-        if track_convergence:
-            cost_history, iter_times = clf.cost_history_, clf.iter_times_
-        if track_centroids:
-            n_centroids_history = clf.n_centroids_history_
-        print(f" -> Cost: {cost:.2f} | Time: {elapsed_time:.2f}s")
     except ValueError as e:
-        # può succedere che il campionamento casuale non produca abbastanza
-        # candidati centroidi (l troppo piccolo rispetto a k): logghiamo
-        # il fallimento invece di interrompere l'intero benchmark.
-        cost, elapsed_time = None, None
-        print(f" -> FAILED: {e}")
+        # Caso noto e benigno: il pool di candidati resta sotto k (l troppo
+        # piccolo rispetto a k) e sklearn solleva ValueError nel reclustering
+        # ("n_samples=X should be >= n_clusters=Y"). Qualsiasi ALTRO
+        # ValueError e' un vero errore (shape, policy, bug): non va mascherato.
+        if "n_clusters" not in str(e):
+            raise
+        elapsed_time = time.time() - start_time
+        print(f" -> SEEDING FAILED (candidati < k): {e}")
+        result = {
+            "k": k,
+            "l": l,
+            "r": r,
+            "r_effective": getattr(clf, "n_rounds_", None),
+            "partitions": num_partitions,
+            "cost": None,
+            "time": elapsed_time,
+            "seed": seed,
+        }
+        if track_convergence:
+            result["cost_history"] = cost_history
+            result["iter_times"] = iter_times
+        if track_centroids:
+            result["n_centroids_history"] = n_centroids_history
+        return result, X_bag
+
+    clf.fit(X_bag, max_iter=max_iter_fit, track_convergence=track_convergence)
+    elapsed_time = time.time() - start_time
+
+    cost = calculate_inertia(X_bag, clf.final_centroids)
+    if track_convergence:
+        cost_history, iter_times = clf.cost_history_, clf.iter_times_
+    if track_centroids:
+        n_centroids_history = clf.n_centroids_history_
+    print(f" -> Cost: {cost:.2f} | Time: {elapsed_time:.2f}s")
 
     result = {
         "k": k,
         "l": l,
         "r": r,
+        "r_effective": getattr(clf, "n_rounds_", None),
         "partitions": num_partitions,
         "cost": cost,
         "time": elapsed_time,
+        "seed": seed,
     }
     if track_convergence:
         result["cost_history"] = cost_history
@@ -141,7 +157,11 @@ def run_benchmark(client, X_bag, combinations, k_values, label="benchmark", max_
     max_iter_fit : int
         Numero massimo di iterazioni di Lloyd's per la fase di fit().
     seed : int
-        Seed per la riproducibilità del campionamento.
+        Seed base per la riproducibilità: la ripetizione i-esima usa
+        ``seed + i`` (come run_comparison), cosicché le ``averaging_iterations``
+        ripetute campionano davvero esecuzioni diverse e la media/std sui
+        costi ha significato statistico (con seed fisso si mediarebbe lo
+        stesso identico risultato).
     averaging_iterations : int
         Numero di iterazioni su cui effettuare la media
     Returns
@@ -181,17 +201,20 @@ def run_benchmark(client, X_bag, combinations, k_values, label="benchmark", max_
                 current_partitions = num_partitions
 
             l = max(1, round(l_over_k * k))
-            if l/k <= 0.1:
-                r=15
+            # NOTA: il numero di round effettivo (inclusa la regola del
+            # paper "l/k <= 0.1 -> 15") e' risolto DENTRO kmeans_parallel
+            # (resolve_rounds) e registrato nella colonna r_effective dei
+            # risultati: nessun override duplicato qui nel driver.
 
             print(f"Testing: k={k}, workers={n_workers}, partitions={num_partitions}, "
                   f"l={l} (l/k={l_over_k}), r={r}",f"\n Iterating {averaging_iterations} times.")
 
             for i in range(averaging_iterations):
+                run_seed = seed + i  # seed diverso per ripetizione: media reale
                 result, current_bag = run_single_test(
                     client, k=k, l=l, r=r,
                     num_partitions=num_partitions,
-                    max_iter_fit=max_iter_fit, seed=seed,
+                    max_iter_fit=max_iter_fit, seed=run_seed,
                     X_bag=current_bag,
                 )
                 result["workers"] = n_workers

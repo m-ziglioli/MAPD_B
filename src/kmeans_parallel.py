@@ -58,8 +58,31 @@ def _bag_to_matrices(X):
     return [dask.delayed(_stack_rows, pure=True)(p) for p in X.to_delayed()]
 
 
+def _persist_matrices(X):
+    """Come _bag_to_matrices, ma le matrici per partizione vengono
+    MATERIALIZZATE una sola volta (futures sul cluster, cache nello
+    scheduler locale). Tutti i task successivi di seeding/fit referenziano
+    questi nodi: senza persistenza ogni round/iterazione rimpilerebbe da
+    capo le partizioni del bag (vstack di migliaia di righe minuscole),
+    moltiplicando inutilmente il lavoro piu' costoso del motore."""
+    parts = _bag_to_matrices(X)
+    if parts:
+        parts = list(dask.persist(*parts))
+    return parts
+
+
 def _matrix_shape(M):
     return M.shape
+
+
+def _row_at(M, i):
+    """Riga i-esima di una matrice per partizione (copia indipendente)."""
+    return M[i].copy()
+
+
+def _state_cost(state):
+    """Somma delle d^2 minime correnti su una partizione (scalare)."""
+    return float(state[:, 0].sum())
 
 
 def _pairwise_d2(M, C):
@@ -113,17 +136,18 @@ def _init_state(M, c0):
     return np.column_stack([d2, np.zeros(len(M))])
 
 
-def _sample_round(M, state, l, cost, seed_seq, round_idx):
+def _sample_round(M, state, l, cost, round_seed_seq):
     """Campionamento Bernoulli vettorizzato su una partizione.
 
     Ogni punto viene campionato con probabilita' min(1, l * d2 / cost) usando
-    un RNG locale derivato da (seed_seq, indice di partizione implicito nel
-    seed_seq figlio, round): deterministico e parallelo-safe.
+    un RNG locale derivato dalla SeedSequence figlia (partizione, round),
+    pre-derivata dal chiamante: deterministico e parallelo-safe, senza
+    condivisione di stream fra estrazioni diverse.
     Ritorna la matrice (t, d) dei punti campionati.
     """
     if M.shape[0] == 0 or cost <= 0.0:
         return np.empty((0, M.shape[1] if M.ndim == 2 else 0))
-    rng = np.random.default_rng([seed_seq.entropy % (2**32), *seed_seq.spawn_key, round_idx])
+    rng = np.random.default_rng(round_seed_seq)
     probs = np.minimum(1.0, state[:, 0] * l / cost)
     mask = rng.random(M.shape[0]) < probs
     return M[mask]
@@ -131,9 +155,14 @@ def _sample_round(M, state, l, cost, seed_seq, round_idx):
 
 def _update_state(M, state, new_centroids, start_idx):
     """Aggiorna lo stato (d^2 min, indice centroide) dopo aver aggiunto i
-    candidati ``new_centroids`` (t, d) che partono dall'indice start_idx."""
+    candidati ``new_centroids`` (t, d) che partono dall'indice start_idx.
+
+    Ritorna (stato aggiornato, somma parziale delle d^2 minime): il costo
+    del round e' fuso nell'aggiornamento, cosicche' attraverso il confine
+    client/cluster passa solo lo scalare e non la matrice di stato.
+    """
     if M.shape[0] == 0 or new_centroids.shape[0] == 0:
-        return state
+        return state, float(state[:, 0].sum())
     d2_new = _pairwise_d2(M, new_centroids)
     min_new_idx = d2_new.argmin(axis=1)
     min_new_dist = d2_new[np.arange(M.shape[0]), min_new_idx]
@@ -141,7 +170,7 @@ def _update_state(M, state, new_centroids, start_idx):
     out = state.copy()
     out[closer, 0] = min_new_dist[closer]
     out[closer, 1] = (min_new_idx[closer] + start_idx).astype(state[:, 1].dtype)
-    return out
+    return out, float(out[:, 0].sum())
 
 
 def _partition_bincount(state, n_centers):
@@ -149,6 +178,41 @@ def _partition_bincount(state, n_centers):
     if state.shape[0] == 0:
         return np.zeros(n_centers, dtype=np.int64)
     return np.bincount(state[:, 1].astype(np.int64), minlength=n_centers)
+
+
+def resolve_rounds(l, k, r=None, alpha=1.0, psi=None, policy="auto"):
+    """Numero di round k-means|| da eseguire, in un UNICO punto del codice.
+
+    policy="auto" (default) segue il protocollo del paper (Bahmani et al.,
+    VLDB 2012):
+      - se l/k <= 0.1 servono piu' round per accumulare almeno k candidati:
+        vengono usati 15 round, a prescindere da ``r``;
+      - altrimenti vince un ``r`` esplicito;
+      - senza ``r`` si stima con round(alpha * log(psi)).
+
+    policy="fixed" usa sempre ed esclusivamente ``r`` (obbligatorio):
+    escape hatch esplicito per bypassare la regola del paper.
+
+    Nota: la regola l/k<=0.1 -> 15 e' volutamente mantenuta anche quando
+    ``r`` e' fornito (comportamento storico del progetto); i driver
+    registrano comunque il numero di round EFFETTIVO (``n_rounds_`` /
+    colonna ``r_effective`` nei CSV) cosicche' le sweep confrontano le
+    configurazioni sul valore realmente eseguito.
+    """
+    if policy not in ("auto", "fixed"):
+        raise ValueError("policy deve essere 'auto' o 'fixed'")
+    if policy == "fixed":
+        if r is None:
+            raise ValueError("policy='fixed' richiede un numero di round r esplicito")
+        return int(r)
+    # policy == "auto"
+    if l / k <= 0.1:
+        return 15
+    if r is not None:
+        return int(r)
+    if psi is None or psi <= 0:
+        raise ValueError("senza r esplicito serve psi > 0 per stimare i round")
+    return max(1, int(round(alpha * float(np.log(psi)))))
 
 
 def _labels_partition(M, C):
@@ -166,12 +230,24 @@ def _inertia_partial(M, C):
     return float(d2[np.arange(M.shape[0]), d2.argmin(axis=1)].sum())
 
 
+def inertia_of_bag(X_bag, centroids):
+    """Inertia (somma delle d^2 al centroide piu' vicino) sull'intera bag,
+    con un task vettorizzato per partizione. Unico punto di calcolo condiviso
+    da kmeans_parallel.inertia() e benchmark.calculate_inertia()."""
+    centroids_arr = np.vstack(centroids)
+    partials = dask.compute(
+        *[dask.delayed(_inertia_partial, pure=False)(p, centroids_arr)
+          for p in _bag_to_matrices(X_bag)]
+    )
+    return float(sum(partials))
+
+
 class kmeans_parallel():
     """K-means con inizializzazione parallela (k-means||) su Dask."""
 
     # --------------------------------------------------------------------
 
-    def __init__(self, k, l, r):
+    def __init__(self, k, l, r=None):
         """
         Parameters
         ----------
@@ -180,24 +256,32 @@ class kmeans_parallel():
         l : int
             Fattore di oversampling: numero atteso di candidati campionati
             ad ogni round dell'inizializzazione parallela.
-        r : int
-            Numero di round dell'inizializzazione parallela (se None,
-            viene stimato automaticamente da compute_starting_centroids).
+        r : int, optional
+            Numero di round dell'inizializzazione parallela. Se None, viene
+            risolto da ``resolve_rounds`` (regola del paper: 15 se
+            l/k <= 0.1, altrimenti alpha * log(psi)).
         """
         self.k = k
         self.l = l  # oversampling factor
-        self.r = r  # number of iterations
+        self.r = r  # numero di round richiesto (None = auto)
         self.centroids = []
-        self.n_iter_ = None  # iterazioni di Lloyd's eseguite da fit()
+        self.starting_centroids = None  # impostato da compute_starting_centroids
+        self.final_centroids = None     # impostato da fit
+        self.n_iter_ = None    # iterazioni di Lloyd's eseguite da fit()
+        self.n_rounds_ = None  # round k-means|| effettivamente eseguiti
 
     # --------------------------------------------------------------------
 
-    def compute_starting_centroids(self, X, alpha=1, l=None, max_iter=None, seed=None, track_centroids=False):
+    def compute_starting_centroids(self, X, alpha=1, l=None, max_iter=None, seed=None, track_centroids=False, policy="auto"):
         """Inizializzazione k-means|| parallela: seleziona un pool di
         candidati centroidi campionando iterativamente da X con
         probabilita' proporzionale alla distanza al quadrato dal centroide
         piu' vicino gia' scelto, poi li riduce a k centroidi finali con un
         k-means pesato (scikit-learn).
+
+        Il numero di round e' risolto da ``resolve_rounds`` (policy="auto",
+        regola del paper) oppure preso com'e' con policy="fixed"; il valore
+        effettivamente eseguito resta in ``self.n_rounds_``.
 
         Se track_centroids=True, salva in self.n_centroids_history_ il
         numero cumulativo di candidati centroidi dopo ogni round eseguito,
@@ -206,7 +290,7 @@ class kmeans_parallel():
         Deterministico dato ``seed``: le estrazioni usano SeedSequence(seed)
         e un RNG per (partizione, round), non il RNG globale di NumPy.
         """
-        parts = _bag_to_matrices(X)
+        parts = _persist_matrices(X)
         shapes = dask.compute(*[dask.delayed(_matrix_shape, pure=True)(p) for p in parts])
         n_points = int(sum(s[0] for s in shapes))
 
@@ -214,19 +298,23 @@ class kmeans_parallel():
             self.n_centroids_history_ = []
 
         # SeedSequence padre: entropia deterministica se seed e' fornito,
-        # casuale altrimenti. Da qui derivano TUTTE le estrazioni.
-        seed_seq = np.random.SeedSequence(seed)
+        # casuale altrimenti. Da qui derivano TUTTE le estrazioni, su tre
+        # rami figli INDIPENDENTI (spawn): centroide iniziale, round di
+        # campionamento, reclustering pesato. Usare la stessa sequenza per
+        # piu' Generator duplicherebbe lo stesso stream (estrazioni
+        # correlate): ogni consumo ha il suo ramo.
+        ss_init, ss_body, ss_reclust = np.random.SeedSequence(seed).spawn(3)
 
         # STEP 1: centroide iniziale casuale (uniforme su tutti i punti,
         # via indice estratto dal RNG dedicato)
-        rng = np.random.default_rng(seed_seq)
+        rng = np.random.default_rng(ss_init)
         initial_idx = int(rng.integers(n_points))
         offset = 0
         for p_idx, (m, _) in enumerate(shapes):
             if initial_idx < offset + m:
                 local = initial_idx - offset
                 initial_centroid = np.asarray(
-                    dask.delayed(lambda M, i: M[i].copy(), pure=True)(
+                    dask.delayed(_row_at, pure=True)(
                         parts[p_idx], local
                     ).compute(),
                     dtype=np.float64,
@@ -236,48 +324,57 @@ class kmeans_parallel():
         initial_centroid = initial_centroid.reshape(1, -1)
         self.centroids.append(initial_centroid)
 
-        # stato per partizione: (m, 2) -> (d^2 minima, indice centroide)
-        states = dask.compute(
-            *[dask.delayed(_init_state, pure=True)(p, initial_centroid[0]) for p in parts]
-        )
+        # stato per partizione: (m, 2) -> (d^2 minima, indice centroide).
+        # Lo stato resta lato worker per TUTTO il seeding (catena di task
+        # ritardati): al client arrivano solo gli scalari di costo, uno per
+        # partizione per round — mai la matrice (m, 2) completa.
+        state_delays = [
+            dask.delayed(_init_state, pure=False)(p, initial_centroid[0])
+            for p in parts
+        ]
 
-        # STEP 2: costo iniziale
-        psi = float(sum(s[:, 0].sum() for s in states))
+        # STEP 2: costo iniziale (solo scalari verso il client)
+        psi = float(sum(dask.compute(*[
+            dask.delayed(_state_cost, pure=False)(s) for s in state_delays
+        ])))
         if psi == 0.0:
             # Tutti i punti coincidono con il centroide iniziale: non c'e'
             # nulla da campionare. Si rispetta il contratto della classe
             # (starting_centroids ha esattamente k righe) ripetendo il
             # centroide; il costo e' comunque 0.
+            self.n_rounds_ = 0
             self.starting_centroids = np.repeat(initial_centroid, self.k, axis=0)
             return
 
-        # STEP 3: determina il numero di round
+        # STEP 3: numero di round, risolto in un unico punto (resolve_rounds)
         if l is None:
             l = self.l
-        if max_iter is None:
-            ratio = (l if l is not None else self.l) / self.k
-            if ratio <= 0.1:
-                max_iter = 15
-                # se l/k è piccolo, per piccoli valori di r rischiamo di avere meno di k valori, e il codice si interrompe
-            elif self.r is not None:
-                max_iter = self.r
-            else:
-                max_iter = int(round(alpha * np.log(psi)))
+        n_rounds = resolve_rounds(
+            l=l, k=self.k,
+            r=self.r if max_iter is None else max_iter,
+            alpha=alpha, psi=psi, policy=policy,
+        )
 
-        # chiavi RNG figlie, una per partizione: indipendenti per costruzione
-        child_seeds = seed_seq.spawn(len(parts))
+        # chiavi RNG figlie, una per partizione: indipendenti per costruzione.
+        # I seed per (partizione, round) sono pre-derivati in blocco con
+        # spawn (deterministico): nessun stream condiviso, nessun trucco
+        # sull'entropia.
+        child_seeds = ss_body.spawn(len(parts))
+        round_seeds = [child.spawn(n_rounds) for child in child_seeds]
 
         cost = psi
-        for round_idx in range(max_iter):
+        rounds_run = 0
+        for round_idx in range(n_rounds):
             if cost == 0.0:
                 break
+            rounds_run += 1
 
             # probabilità di campionamento per ogni punto (vettore per partizione)
             sample_tasks = [
                 dask.delayed(_sample_round, pure=False)(
-                    p, s, l, cost, child_seeds[j], round_idx
+                    p, s, l, cost, round_seeds[j][round_idx]
                 )
-                for j, (p, s) in enumerate(zip(parts, states))
+                for j, (p, s) in enumerate(zip(parts, state_delays))
             ]
             sampled_parts = dask.compute(*sample_tasks)
             sampled = [s for s in sampled_parts if s.shape[0] > 0]
@@ -293,30 +390,37 @@ class kmeans_parallel():
                     dask.delayed(_update_state, pure=False)(
                         p, s, new_centroids_arr, start_idx
                     )
-                    for p, s in zip(parts, states)
+                    for p, s in zip(parts, state_delays)
                 ]
-                states = dask.compute(*update_tasks)
+                # lo stato aggiornato NON viene raccolto sul client: ne
+                # teniamo i riferimenti simbolici (input del round dopo) e
+                # calcoliamo solo gli scalari di costo fusi in _update_state.
+                state_delays = [u[0] for u in update_tasks]
+                cost = float(sum(dask.compute(*[u[1] for u in update_tasks])))
 
             if track_centroids:
                 self.n_centroids_history_.append(len(self.centroids))
 
-            # aggiorno il costo corrente per il prossimo round
-            cost = float(sum(s[:, 0].sum() for s in states))
+        # round effettivamente eseguiti (puo' essere < n_rounds se il costo
+        # e' arrivato a zero in anticipo): e' questo il valore che i driver
+        # registrano nei risultati (colonna r_effective).
+        self.n_rounds_ = rounds_run
 
         # STEP 7: pesi = numero di punti assegnati a ciascun candidato centroide
+        # (k-vettori per partizione: unica riduzione finale sugli stati)
         weights = sum(
             dask.compute(*[dask.delayed(_partition_bincount, pure=True)(s, len(self.centroids))
-                           for s in states])
+                           for s in state_delays])
         )
         centroids_weights = weights.astype(np.float64)
 
         # STEP 8: riduzione finale a k centroidi con k-means pesato (scikit-learn)
         # n_init=1: il paper (Bahmani et al.) usa una singola inizializzazione
         # k-means++ per il reclustering, non i 10 restart di default di sklearn.
-        # random_state deriva dalla stessa SeedSequence del seeding: senza,
+        # random_state deriva dal ramo ss_reclust della SeedSequence: senza,
         # il k-means++ interno di sklearn pescherebbe dal RNG globale e il
         # risultato non sarebbe riproducibile nemmeno a parita' di seed.
-        reclustering_random_state = int(np.random.default_rng(seed_seq).integers(2**31 - 1))
+        reclustering_random_state = int(np.random.default_rng(ss_reclust).integers(2**31 - 1))
         kmeans = KMeans(n_clusters=self.k, n_init=1, random_state=reclustering_random_state)
         kmeans.fit(np.vstack(self.centroids), sample_weight=centroids_weights)
         self.starting_centroids = kmeans.cluster_centers_
@@ -330,7 +434,11 @@ class kmeans_parallel():
         Un unico percorso di codice: ogni iterazione esegue un task per
         partizione che calcola assegnazioni, somme per cluster, costo e
         numero di etichette cambiate (criterio di convergenza stretto fuso
-        nello stesso passaggio: nessun giro extra sui dati). Se
+        nello stesso passaggio: nessun giro extra sui dati). Le etichette
+        (m,) di ogni partizione NON viaggiano verso il client fra un'
+        iterazione e l'altra: restano nel grafo Dask come input
+        dell'iterazione successiva; al client arrivano solo somme (k,d),
+        conteggi, costo e numero di cambiamenti. Se
         track_convergence=True, le quantita' vengono anche registrate in
         self.cost_history_ (inertia ad ogni iterazione) e self.iter_times_
         (tempo per iterazione).
@@ -339,8 +447,12 @@ class kmeans_parallel():
         Lloyd's effettivamente eseguite (aggiornamenti dei centroidi
         completati).
         """
+        if self.starting_centroids is None:
+            raise RuntimeError(
+                "fit(): chiamare prima compute_starting_centroids(X, ...)"
+            )
 
-        parts = _bag_to_matrices(X)
+        parts = _persist_matrices(X)
         n_partitions = len(parts)
 
         centroids_arr = np.vstack(self.starting_centroids)
@@ -350,6 +462,9 @@ class kmeans_parallel():
             self.cost_history_ = []
             self.iter_times_ = []
 
+        # etichette dell'iterazione precedente, UNA referenza simbolica per
+        # partizione (None alla prima iterazione). Sono Delayed nel grafo:
+        # i vettori (m,) non lasciano mai i worker.
         prev_labels = [None] * n_partitions
         empty_warned = False
 
@@ -360,18 +475,24 @@ class kmeans_parallel():
                 dask.delayed(_lloyd_pass, pure=False)(p, prev_labels[j], centroids_arr)
                 for j, p in enumerate(parts)
             ]
-            results = dask.compute(*tasks)
+            # calcoliamo SOLO le riduzioni piccole t[:4]; l'elemento t[4]
+            # (etichette della partizione) resta nel grafo come stato
+            # distribuito per l'iterazione successiva.
+            reductions = [t[:4] for t in tasks]
+            results = dask.compute(*reductions)
 
             sums = np.zeros_like(centroids_arr)
             counts = np.zeros(k, dtype=np.int64)
             iter_cost = 0.0
             changed = 0
-            for j, (p_sums, p_counts, p_cost, p_changed, p_labels) in enumerate(results):
+            for p_sums, p_counts, p_cost, p_changed in results:
                 sums += p_sums
                 counts += p_counts
                 iter_cost += p_cost
                 changed += p_changed
-                prev_labels[j] = p_labels
+
+            # le nuove etichette diventano lo stato distribuito del giro dopo
+            prev_labels = [t[4] for t in tasks]
 
             new_centroids = centroids_arr.copy()
             populated = counts > 0
@@ -409,6 +530,10 @@ class kmeans_parallel():
     def classify(self, X):
         """Ritorna un Dask Bag con l'indice del cluster più vicino per
         ogni punto di X, usando i centroidi finali calcolati da fit()."""
+        if self.final_centroids is None:
+            raise RuntimeError(
+                "classify(): chiamare prima fit() (o impostare final_centroids)"
+            )
         centroids_arr = np.vstack(self.final_centroids)
         label_delays = [
             dask.delayed(_labels_partition, pure=False)(p, centroids_arr)
@@ -421,9 +546,8 @@ class kmeans_parallel():
     def inertia(self, X):
         """Calcola l'inertia (somma delle distanze al quadrato dai
         centroidi finali) sull'intero dataset X."""
-        centroids_arr = np.vstack(self.final_centroids)
-        partials = dask.compute(
-            *[dask.delayed(_inertia_partial, pure=False)(p, centroids_arr)
-              for p in _bag_to_matrices(X)]
-        )
-        return float(sum(partials))
+        if self.final_centroids is None:
+            raise RuntimeError(
+                "inertia(): chiamare prima fit() (o impostare final_centroids)"
+            )
+        return inertia_of_bag(X, self.final_centroids)
