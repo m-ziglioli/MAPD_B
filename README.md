@@ -35,7 +35,11 @@ iterations. Dataset: KDD Cup 1999.
 ```bash
 conda env create -f environment.yml     # or: pip install -r requirements.txt
 conda activate mapd-b
+python -m ipykernel install --user --name mapd-b --display-name "Python (mapd-b)"
 ```
+
+`requirements.txt` replicates the exact package freeze of the cluster nodes
+(see header), so local runs use the same dask/numpy/pyarrow stack as the VMs.
 
 Run notebooks and scripts **from the repository root**, so that `src.*`
 imports and the relative `results/`, `figures/` paths resolve correctly.
