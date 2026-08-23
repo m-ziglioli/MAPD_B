@@ -15,3 +15,7 @@ scheduler.json
 Thumbs.db
 .vscode/
 .idea/
+
+# --- Local agentic harness (working-only, not shared) ---
+AGENTS.md
+agents/

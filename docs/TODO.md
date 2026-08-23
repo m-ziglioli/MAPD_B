@@ -9,6 +9,6 @@
 - ricontrollare bene code
 - sistemare la criticità dei calcoli punto-per-punto con bag.map(lambda ...) in
   fit()/compute_starting_centroids (vettorizzare per partizione con
-  map_partitions, es. sklearn.metrics.pairwise.euclidean_distances - vedi
-  prototipo/risultati in experiments/vectorized_partitions/)
+  map_partitions, es. sklearn.metrics.pairwise.euclidean_distances)
+
 
