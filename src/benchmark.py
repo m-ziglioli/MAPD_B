@@ -125,7 +125,9 @@ def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X
     return result, X_bag
 
 
-def run_benchmark(client, X_bag, combinations, k_values, label="benchmark", max_iter_fit=10, seed=42,averaging_iterations = 10):
+def run_benchmark(client, X_bag=None, combinations=None, k_values=None,
+                  label="benchmark", max_iter_fit=10, seed=42,
+                  averaging_iterations=10, X_arr=None):
     """
     Esegue una griglia di test e salva i risultati in un CSV timestampato
     dentro ./results.
@@ -134,17 +136,10 @@ def run_benchmark(client, X_bag, combinations, k_values, label="benchmark", max_
     ----------
     client : dask.distributed.Client
         Client connesso al cluster Dask.
-    X_bag : dask.bag.Bag
+    X_bag : dask.bag.Bag, optional
         Dataset (già caricato/preprocessato) su cui testare, come Dask Bag
-        distribuita (es. l'output di data_loader.load_dataset). Viene
-        materializzato in un array numpy lato client una sola volta
-        all'inizio (costo limitato alla dimensione del dataset, pagato una
-        volta per l'intero benchmark), poi per ogni combinazione viene
-        ridistribuito ai worker con client.scatter() (via _build_bag) al
-        numero di partizioni richiesto. Bag.repartition() è stato scartato:
-        nei test si è rivelato un collo di bottiglia poco parallelizzato
-        (vedi CHANGES.md), mentre client.scatter() distribuisce bene su
-        tutto il cluster.
+        distribuita (es. l'output di data_loader.load_dataset). Se X_arr è
+        fornito può essere omesso.
     combinations : list of tuple
         Lista di (n_workers, num_partitions, l_over_k, r). n_workers è
         informativo/di logging: il cluster va già dimensionato a monte con
@@ -164,6 +159,11 @@ def run_benchmark(client, X_bag, combinations, k_values, label="benchmark", max_
         stesso identico risultato).
     averaging_iterations : int
         Numero di iterazioni su cui effettuare la media
+    X_arr : np.ndarray, optional
+        Dataset GIÀ materializzato lato client: evita il gather della bag
+        all'inizio (utile quando chi chiama ha già l'array, es.
+        run_worker_sweep riutilizza lo stesso array per piu' conteggi di
+        worker). Con X_arr fornito, X_bag può essere None.
     Returns
     -------
     df_results : pd.DataFrame
@@ -176,10 +176,13 @@ def run_benchmark(client, X_bag, combinations, k_values, label="benchmark", max_
     # partizione in UN SOLO array 2D dentro il grafo Dask (calcolato sul
     # worker), cosi' sulla rete viaggiano solo len(partitions) blocchi
     # compatti invece di centinaia di migliaia di piccoli oggetti.
-    delayed_partitions = [dask.delayed(np.vstack)(p) for p in X_bag.to_delayed()]
-    partition_futures = client.compute(delayed_partitions)
-    partitions = client.gather(partition_futures)
-    X_arr = np.vstack(partitions)
+    if X_arr is None:
+        if X_bag is None:
+            raise ValueError("run_benchmark: fornire X_bag oppure X_arr")
+        delayed_partitions = [dask.delayed(np.vstack)(p) for p in X_bag.to_delayed()]
+        partition_futures = client.compute(delayed_partitions)
+        partitions = client.gather(partition_futures)
+        X_arr = np.vstack(partitions)
 
     results = []
     current_workers = None
@@ -234,3 +237,55 @@ def run_benchmark(client, X_bag, combinations, k_values, label="benchmark", max_
         print(res)
 
     return df_results
+
+
+def run_worker_sweep(X_arr, workers_list, combinations_fn, k_values,
+                     label="worker_sweep", max_iter_fit=10, seed=42,
+                     averaging_iterations=10):
+    """Sweep che varia workers E partizioni in simultanea (todo del
+    progetto): per ogni n in workers_list riavvia il cluster via SSH
+    (launch_cluster(n)), esegue la griglia generata da combinations_fn(n),
+    spegne il cluster e concatena i risultati in un unico DataFrame.
+
+    Parameters
+    ----------
+    X_arr : np.ndarray
+        Dataset materializzato lato client UNA volta per tutta la sweep:
+        ogni riavvio del cluster fa ripartire lo scatter da qui (nessun
+        re-gather dalla bag).
+    workers_list : list of int
+        Conteggi di worker da testare, es. [2, 4, 8].
+    combinations_fn : callable
+        n -> lista di (n_workers, num_partitions, l_over_k, r). Tipico:
+        ``lambda w: [(w, w // 2, 1.0, R), (w, w, 1.0, R), (w, 2 * w, 1.0, R)]``.
+    k_values : list of int
+        Valori di k per ciascuna griglia.
+
+    Returns
+    -------
+    pd.DataFrame con tutte le run; colonna extra ``workers_cfg``.
+    Un CSV per conteggio di worker viene comunque salvato in results/
+    (suffisso _w{n}), come da comportamento di run_benchmark.
+    """
+    from src.launch_cluster import launch_cluster, shutdown_cluster
+
+    frames = []
+    for n in workers_list:
+        print(f"\n=== worker sweep: {n} workers ===")
+        cluster, client = launch_cluster(n)
+        try:
+            df_n = run_benchmark(
+                client,
+                combinations=combinations_fn(n),
+                k_values=k_values,
+                label=f"{label}_w{n}",
+                max_iter_fit=max_iter_fit,
+                seed=seed,
+                averaging_iterations=averaging_iterations,
+                X_arr=X_arr,
+            )
+            df_n["workers_cfg"] = n
+            frames.append(df_n)
+        finally:
+            shutdown_cluster(cluster, client)
+    return pd.concat(frames, ignore_index=True)
