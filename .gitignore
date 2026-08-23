@@ -19,3 +19,6 @@ Thumbs.db
 # --- Local agentic harness (working-only, not shared) ---
 AGENTS.md
 agents/
+
+# --- Local opencode project config (working-only, not shared) ---
+.opencode/
