@@ -23,9 +23,9 @@ import dask
 import numpy as np
 import pandas as pd
 
-from benchmark import RESULTS_DIR, _build_bag, calculate_inertia
-from kmeans_parallel import kmeans_parallel
-from kmeans_serial import kmeans_serial
+from src.benchmark import RESULTS_DIR, _build_bag, calculate_inertia
+from src.kmeans_parallel import kmeans_parallel
+from src.kmeans_serial import kmeans_serial
 
 
 def _materialize_bag(client, X_bag):

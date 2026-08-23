@@ -21,7 +21,7 @@ import dask.bag as db
 import numpy as np
 import pandas as pd
 
-from kmeans_parallel import kmeans_parallel
+from src.kmeans_parallel import kmeans_parallel
 
 RESULTS_DIR = "results"
 
@@ -39,7 +39,8 @@ def calculate_inertia(X_bag, centroids):
     return X_bag.map(lambda x: np.min(np.linalg.norm(x - centroids_arr, axis=1) ** 2)).sum().compute()
 
 
-def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X=None, X_bag=None):
+def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X=None, X_bag=None,
+                     track_convergence=False, track_centroids=False):
     """
     Esegue una singola run di k-means|| + Lloyd's fit su una combinazione
     di parametri, e ritorna un dict con i risultati.
@@ -47,19 +48,32 @@ def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X
     Se X_bag è già disponibile (es. già scatterato per un test precedente
     con lo stesso numero di partizioni) può essere passato per evitare di
     rifare lo scatter dei dati.
+
+    Se track_convergence=True, il dict di ritorno include anche
+    "cost_history" e "iter_times" (uno per iterazione di Lloyd's fit),
+    utili per ispezionare la convergenza di questa run.
+
+    Se track_centroids=True, il dict di ritorno include anche
+    "n_centroids_history" (numero cumulativo di candidati centroidi dopo
+    ogni round di k-means||).
     """
     if X_bag is None:
         X_bag = _build_bag(client, X, num_partitions)
 
     clf = kmeans_parallel(k=k, l=l, r=r)
+    cost_history, iter_times, n_centroids_history = None, None, None
 
     try:
         start_time = time.time()
-        clf.compute_starting_centroids(X_bag, seed=seed)
-        clf.fit(X_bag, max_iter=max_iter_fit)
+        clf.compute_starting_centroids(X_bag, seed=seed, track_centroids=track_centroids)
+        clf.fit(X_bag, max_iter=max_iter_fit, track_convergence=track_convergence)
         elapsed_time = time.time() - start_time
 
         cost = calculate_inertia(X_bag, clf.final_centroids)
+        if track_convergence:
+            cost_history, iter_times = clf.cost_history_, clf.iter_times_
+        if track_centroids:
+            n_centroids_history = clf.n_centroids_history_
         print(f" -> Cost: {cost:.2f} | Time: {elapsed_time:.2f}s")
     except ValueError as e:
         # può succedere che il campionamento casuale non produca abbastanza
@@ -68,17 +82,24 @@ def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X
         cost, elapsed_time = None, None
         print(f" -> FAILED: {e}")
 
-    return {
+    result = {
         "k": k,
         "l": l,
         "r": r,
         "partitions": num_partitions,
         "cost": cost,
         "time": elapsed_time,
-    }, X_bag
+    }
+    if track_convergence:
+        result["cost_history"] = cost_history
+        result["iter_times"] = iter_times
+    if track_centroids:
+        result["n_centroids_history"] = n_centroids_history
+
+    return result, X_bag
 
 
-def run_benchmark(client, X, combinations, k_values, label="benchmark", max_iter_fit=10, seed=42,averaging_iterations = 10):
+def run_benchmark(client, X_bag, combinations, k_values, label="benchmark", max_iter_fit=10, seed=42,averaging_iterations = 10):
     """
     Esegue una griglia di test e salva i risultati in un CSV timestampato
     dentro ./results.
@@ -87,8 +108,17 @@ def run_benchmark(client, X, combinations, k_values, label="benchmark", max_iter
     ----------
     client : dask.distributed.Client
         Client connesso al cluster Dask.
-    X : np.ndarray
-        Dataset (già caricato/preprocessato) su cui testare.
+    X_bag : dask.bag.Bag
+        Dataset (già caricato/preprocessato) su cui testare, come Dask Bag
+        distribuita (es. l'output di data_loader.load_dataset). Viene
+        materializzato in un array numpy lato client una sola volta
+        all'inizio (costo limitato alla dimensione del dataset, pagato una
+        volta per l'intero benchmark), poi per ogni combinazione viene
+        ridistribuito ai worker con client.scatter() (via _build_bag) al
+        numero di partizioni richiesto. Bag.repartition() è stato scartato:
+        nei test si è rivelato un collo di bottiglia poco parallelizzato
+        (vedi CHANGES.md), mentre client.scatter() distribuisce bene su
+        tutto il cluster.
     combinations : list of tuple
         Lista di (n_workers, num_partitions, l_over_k, r). n_workers è
         informativo/di logging: il cluster va già dimensionato a monte con
@@ -109,10 +139,22 @@ def run_benchmark(client, X, combinations, k_values, label="benchmark", max_iter
     df_results : pd.DataFrame
         DataFrame con tutti i risultati.
     """
+    # Materializziamo il dataset lato client una sola volta. X_bag contiene
+    # un array numpy separato per ogni singola riga (vedi data_loader.py),
+    # quindi un gather diretto dovrebbe serializzare ~500k oggetti minuscoli
+    # invece di poche decine di blocchi compatti: qui vstack-iamo ogni
+    # partizione in UN SOLO array 2D dentro il grafo Dask (calcolato sul
+    # worker), cosi' sulla rete viaggiano solo len(partitions) blocchi
+    # compatti invece di centinaia di migliaia di piccoli oggetti.
+    delayed_partitions = [dask.delayed(np.vstack)(p) for p in X_bag.to_delayed()]
+    partition_futures = client.compute(delayed_partitions)
+    partitions = client.gather(partition_futures)
+    X_arr = np.vstack(partitions)
+
     results = []
     current_workers = None
     current_partitions = None
-    X_bag = None
+    current_bag = None
 
     for k in k_values:
         for n_workers, num_partitions, l_over_k, r in combinations:
@@ -122,22 +164,25 @@ def run_benchmark(client, X, combinations, k_values, label="benchmark", max_iter
                 current_partitions = None
 
             if num_partitions != current_partitions:
-                X_bag = _build_bag(client, X, num_partitions)
+                old_bag = current_bag
+                current_bag = _build_bag(client, X_arr, num_partitions)
+                if old_bag is not None:
+                    client.cancel(old_bag)
                 current_partitions = num_partitions
 
             l = max(1, round(l_over_k * k))
             if l/k <= 0.1:
                 r=15
-                
+
             print(f"Testing: k={k}, workers={n_workers}, partitions={num_partitions}, "
                   f"l={l} (l/k={l_over_k}), r={r}",f"\n Iterating {averaging_iterations} times.")
 
             for i in range(averaging_iterations):
-                result, X_bag = run_single_test(
-                    client, X, k=k, l=l, r=r,
+                result, current_bag = run_single_test(
+                    client, k=k, l=l, r=r,
                     num_partitions=num_partitions,
                     max_iter_fit=max_iter_fit, seed=seed,
-                    X_bag=X_bag,
+                    X_bag=current_bag,
                 )
                 result["workers"] = n_workers
                 result["l_over_k"] = l_over_k

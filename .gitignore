@@ -1,3 +1,17 @@
+# --- Data & caches (regenerable, never commit) ---
+data/
+results/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# --- Cluster / Dask artifacts ---
+*.lock
+dask-worker-space/
+scheduler.json
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

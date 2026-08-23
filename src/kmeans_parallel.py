@@ -7,7 +7,7 @@ distribuita.
 
 Uso tipico (da notebook):
 
-    from kmeans_parallel import kmeans_parallel
+    from src.kmeans_parallel import kmeans_parallel
 
     clf = kmeans_parallel(k=500, l=200, r=5)
     clf.compute_starting_centroids(X_bag, seed=42)

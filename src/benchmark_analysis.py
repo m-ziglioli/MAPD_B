@@ -9,11 +9,11 @@ Modulo generico per analizzare risultati di benchmark:
 
 Uso rapido (in fondo al file trovi un esempio eseguibile):
 
-    from benchmark_analysis import BenchmarkAnalyzer
+    from src.benchmark_analysis import BenchmarkAnalyzer
 
     analyzer = BenchmarkAnalyzer(
-        data_path="/home/ubuntu/Project/working/results/kddcup99_benchmark_20260714_040919.csv",
-        output_dir="/home/ubuntu/Project/working/results/plots",
+        data_path="results/kddcup99_benchmark_<timestamp>.csv",
+        output_dir="figures",
         facet_cols=["k"],              # una figura per ogni valore (combinazione) di queste colonne
         x_col="l_over_k",               # variabile sull'asse x
         metrics=["cost", "time"],       # colonne di cui calcolare mean/std e plottare

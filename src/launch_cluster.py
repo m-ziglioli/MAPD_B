@@ -5,7 +5,7 @@ Gestione del cluster Dask via SSH.
 
 Pensato per essere importato da notebook:
 
-    from launch_cluster import launch_cluster, shutdown_cluster
+    from src.launch_cluster import launch_cluster, shutdown_cluster
 
     cluster, client = launch_cluster(n_workers=2)
     ...
