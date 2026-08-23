@@ -70,6 +70,40 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _enable_pickle_by_value():
+    """I task del progetto referenziano funzioni dei moduli src.*: di default
+    cloudpickle le serializza PER RIFERIMENTO (modulo+nome), ma scheduler e
+    worker nascono via SSH con cwd=home e non hanno la repo nel sys.path ->
+    'ModuleNotFoundError: No module named src' alla deserializzazione del
+    grafo. Registrando i moduli BY-VALUE il codice viaggia dentro il grafico
+    stesso e nessun processo remoto deve importare il progetto.
+
+    Idempotente; fallisce soft (warning) se qualcosa non torna, per non
+    bloccare l'avvio del cluster."""
+    import warnings
+
+    try:
+        import cloudpickle
+
+        import src  # noqa: F401
+        import src.benchmark  # noqa: F401
+        import src.data_loader  # noqa: F401
+        import src.kmeans_parallel  # noqa: F401
+        import src.kmeans_serial  # noqa: F401
+
+        for mod in (src, src.kmeans_parallel, src.data_loader,
+                    src.benchmark, src.kmeans_serial):
+            try:
+                cloudpickle.register_pickle_by_value(mod)
+            except Exception:
+                pass  # gia' registrato o modulo non serializzabile: non bloccare
+    except Exception as e:
+        warnings.warn(
+            f"pickle-by-value NON attivato ({e}): se i task usano funzioni di "
+            "src.* la deserializzazione sul cluster puo' fallire."
+        )
+
+
 def launch_cluster(n_workers: int, block: bool = False, startup_timeout: float = DEFAULT_STARTUP_TIMEOUT):
     """Avvia lo SSHCluster con i primi n_workers nodi da WORKER_IPS e si
     connette con un Client.
@@ -126,6 +160,11 @@ def launch_cluster(n_workers: int, block: bool = False, startup_timeout: float =
             f"\n[AVVISO] Timeout ({startup_timeout:.0f}s): connessi "
             f"{connected}/{n_workers} worker. Si procede con quelli disponibili."
         )
+
+    # Il client deve poter serializzare le funzioni di src.* per valore:
+    # vedi _enable_pickle_by_value per il perche' (scheduler/worker via SSH
+    # non hanno la repo nel sys.path).
+    _enable_pickle_by_value()
 
     if block:
         print("\n[INFO] Il cluster rimarrà attivo finché questo script è in esecuzione.")
