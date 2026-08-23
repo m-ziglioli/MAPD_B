@@ -1,5 +1,52 @@
 # Changelog
 
+## 2026-08-23 — Determinismo del seeding + engine vettorizzato per-partizione
+
+Il bug di non-riproducibilità del seed (vedi 2026-07-19) è **risolto**, e
+l'intero engine di `kmeans_parallel` è stato riscritto attorno a calcoli
+vettorizzati per partizione. Riepilogo dei commit:
+
+### `bc66c19` — determinismo + correzioni di correttezza
+- Campionamento Bernoulli dei round senza più RNG globale: uniformi
+  pre-estratte da un `Generator` locale costruito dal `seed` (flusso
+  deterministico, indipendente dall'ordine dei thread dello scheduler).
+- Centroide iniziale estratto via indice uniforme dal RNG locale
+  (niente più `dask.bag.random`, che usava `random` globale).
+- `KMeans` del reclustering pesato (Step 8) ora riceve un `random_state`
+  derivato dalla stessa `SeedSequence`: era la causa residua di
+  non-riproducibilità a parità di candidati (bug pre-esistente).
+- `fit()`: warning sui cluster vuoti e nuovo attributo `n_iter_`
+  (parità con `kmeans_serial`); rimossa la side effect globale
+  `np.random.seed(...)`.
+- Early-return `psi == 0`: `starting_centroids` ora ha sempre k righe.
+
+### `5f3371e` — refactor vettorizzato (motore su matrici per partizione)
+- La Bag viene scomposta in partizioni ritardate (`to_delayed`), ognuna
+  impilata in una matrice `(m, d)`: ogni passaggio è un task NumPy per
+  partizione. Eliminate le lambda punto-per-punto, lo shuffle di righe
+  del foldby e il passaggio extra di controllo convergenza (ora fuso
+  nell'assegnazione via conteggio delle etichette cambiate).
+- Distanze con espansione quadratica `||x||² + ||c||² − 2x·c`: una
+  matmul BLAS per passaggio. Nota: durante lo sviluppo un einsum con
+  asse sbagliato (`->j` invece di `->i`) sulle norme dei centroidi ha
+  causato un ValueError — corretto con regression test.
+- Seeding: stato come array `(m, 2)` per partizione; RNG per
+  (partizione, round) da `SeedSequence.spawn`.
+- `classify`/`inertia`/`benchmark.calculate_inertia` sullo stesso pattern;
+  rimosso `min_dists` (nessun consumer).
+- **Timing locale** (n=20k, d=15, k=20, 8 partizioni): seed 12.80s → 0.42s,
+  fit 1.24s → 0.04s, inertia 0.62s → 0.02s (~30x); costo finale identico
+  (672313.9799) e golden regression bit-identica su centroidi fissi.
+- `agents/smoke_test.py` ora verifica anche determinismo (due run stesso
+  seed ⇒ bit-identici) e regressione golden (`agents/fixtures/`,
+  generati da `agents/make_fixtures.py` prima del refactor).
+
+### Altro (non in src/)
+- `docs/ANALYSIS_PLAN.md`: piano di riproduzione articolo (Tab 3/4,
+  Fig 5.1/5.2) congelato e posticipato.
+- Harness locale: comando opencode `/grill-me` per la review
+  adversarial dei design (`.opencode/`, gitignored).
+
 ## 2026-07-19 — Todo #1: tracking convergenza k-means (fit)
 
 - `kmeans_parallel.py`: aggiunto parametro `track_convergence=False` a `fit()`.
