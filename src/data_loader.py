@@ -113,3 +113,31 @@ def load_dataset(dataset_url, raw_gz_path, parquet_path, parquet_path_workers, c
     print("Number of samples:", ddf.shape[0].compute())
     # return mean and std as well if want to go back to original coordinates later
     return X_bag, (mean,std)
+
+
+# ---------------------------------------------------------------------------
+# Generatori sintetici e helper (per la riproduzione dell'articolo, vedi
+# docs/ANALYSIS_PLAN.md): nessun accesso a rete/disco, tutto in memoria.
+# ---------------------------------------------------------------------------
+
+def make_gauss_mixture(n, k, d=15, R=1.0, seed=None):
+    """GaussMixture della Fig 5.2 di Bahmani et al. (2012): k centri ~
+    N(0, R*I_d), ogni punto assegnato a un centro uniformemente e poi
+    estratto come N(centro, I_d), pesi uguali.
+
+    Ritorna (X (n,d) float64, y (n,) label, centers (k,d)).
+    """
+    rng = np.random.default_rng(seed)
+    centers = rng.normal(0.0, float(R), size=(k, d))
+    y = rng.integers(0, k, size=n)
+    X = centers[y] + rng.normal(0.0, 1.0, size=(n, d))
+    return X.astype(np.float64), y.astype(np.int64), centers
+
+
+def array_to_bag(X, n_partitions=4):
+    """Array numpy (n,d) -> Dask Bag di righe 1-D float64: lo STESSO formato
+    prodotto da load_dataset (un elemento per riga), utile per i test locali
+    e per il GaussMixture senza passare da Parquet."""
+    n_partitions = max(1, min(int(n_partitions), X.shape[0]))
+    rows = [row for chunk in np.array_split(X, n_partitions) for row in chunk]
+    return db.from_sequence(rows, npartitions=n_partitions)
