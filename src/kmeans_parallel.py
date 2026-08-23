@@ -16,16 +16,25 @@ Uso tipico (da notebook):
 """
 
 import time
+import warnings
 
 import dask
 import dask.bag as db
-from dask.bag import random as dask_random
 from sklearn.cluster import KMeans
 import numpy as np
 
 
 class kmeans_parallel():
-    """K-means con inizializzazione parallela (k-means||) su Dask."""
+    """K-means con inizializzazione parallela (k-means||) su Dask.
+
+    Nota sul seeding: a differenza delle versioni precedenti, il campionamento
+    Bernoulli dei round k-means|| NON usa piu' il RNG globale di NumPy (che
+    sotto lo scheduler threaded rendeva i risultati non riproducibili, vedi
+    docs/CHANGES.md 2026-07-19). Tutte le estrazioni derivano da un unico
+    np.random.Generator locale costruito dal seed passato a
+    compute_starting_centroids: a parita' di seed la procedura e' ora
+    deterministica.
+    """
 
     # --------------------------------------------------------------------
 
@@ -46,6 +55,7 @@ class kmeans_parallel():
         self.l = l  # oversampling factor
         self.r = r  # number of iterations
         self.centroids = []
+        self.n_iter_ = None  # iterazioni di Lloyd's eseguite da fit()
 
     # --------------------------------------------------------------------
 
@@ -64,14 +74,26 @@ class kmeans_parallel():
 
         if track_centroids:
             self.n_centroids_history_ = []
+        # RNG locale dedicato: nessuna manipolazione del RNG globale di
+        # NumPy (che era la causa della non-riproducibilita' sotto scheduler
+        # threaded). Con seed=None si usa entropia fresca (comportamento
+        # non deterministico, come prima).
         rng = np.random.default_rng(seed)
-        
-        if seed is not None:
-            np.random.seed(seed)
 
-        # STEP 1: centroide iniziale casuale
-        initial_centroid = dask_random.sample(X, 1).compute()[0]        
-        initial_centroid = np.asarray(initial_centroid).reshape(1, -1)
+        # Numero di punti: serve per l'estrazione uniforme dell'indice del
+        # centroide iniziale e per il flusso deterministico di uniformi.
+        n_points = X.count().compute()
+
+        # STEP 1: centroide iniziale casuale (uniforme su tutti i punti,
+        # via indice estratto dal RNG locale)
+        initial_idx = int(rng.integers(n_points))
+        initial_centroid = (
+            db.zip(db.from_sequence(range(n_points), npartitions=X.npartitions), X)
+            .filter(lambda t, j=initial_idx: t[0] == j)
+            .map(lambda t: t[1])
+            .compute()[0]
+        )
+        initial_centroid = np.asarray(initial_centroid, dtype=np.float64).reshape(1, -1)
         self.centroids.append(initial_centroid)
 
         c0 = initial_centroid[0]
@@ -82,7 +104,11 @@ class kmeans_parallel():
         # STEP 2: costo iniziale
         psi = state.map(lambda t: t[0]).sum().compute()
         if psi == 0.0:
-            self.starting_centroids = np.vstack(self.centroids)
+            # Tutti i punti coincidono con il centroide iniziale: non c'e'
+            # nulla da campionare. Si rispetta il contratto della classe
+            # (starting_centroids ha esattamente k righe) ripetendo il
+            # centroide; il costo e' comunque 0.
+            self.starting_centroids = np.repeat(initial_centroid, self.k, axis=0)
             self.min_dists = state.map(lambda t: t[0])
             return
             
@@ -109,10 +135,14 @@ class kmeans_parallel():
             # probabilità di campionamento per ogni punto
             probs = state.map(lambda t: min(1.0, t[0] * l / cost))
 
-            # accoppia punti e probabilità, campiona con Bernoulli(prob)
-            paired = db.zip(X, probs)
+            # accoppia punti, probabilita' e una uniform deterministica
+            # estratta dal RNG locale (flusso sequenziale, quindi
+            # riproducibile e indipendente dall'ordine con cui lo scheduler
+            # threaded esegue i task), infine campiona con Bernoulli(p).
+            uniforms = db.from_sequence(rng.random(n_points), npartitions=X.npartitions)
+            paired = db.zip(X, probs, uniforms)
             sample = (
-                paired.filter(lambda t: np.random.uniform() < t[1])
+                paired.filter(lambda t: t[2] < t[1])
                       .map(lambda t: t[0])
             ).compute()
 
@@ -151,8 +181,12 @@ class kmeans_parallel():
 
         # STEP 8: riduzione finale a k centroidi con k-means pesato (scikit-learn)
         # n_init=1: il paper (Bahmani et al.) usa una singola inizializzazione
-        # k-means++ per il reclustering, non i 10 restart di default di sklearn
-        kmeans = KMeans(n_clusters=self.k, n_init=1)
+        # k-means++ per il reclustering, non i 10 restart di default di sklearn.
+        # random_state deriva dallo stesso RNG locale del seeding: senza,
+        # il k-means++ interno di sklearn pescherebbe dal RNG globale e il
+        # risultato non sarebbe riproducibile nemmeno a parita' di seed.
+        reclustering_random_state = int(rng.integers(2**31 - 1))
+        kmeans = KMeans(n_clusters=self.k, n_init=1, random_state=reclustering_random_state)
         kmeans.fit(np.vstack(self.centroids), sample_weight=centroids_weights)
         self.starting_centroids = kmeans.cluster_centers_
 
@@ -170,6 +204,9 @@ class kmeans_parallel():
         utile per ispezionare la convergenza. Il costo viene ricavato dallo
         stesso foldby usato per aggiornare i centroidi, senza un secondo
         giro sui dati.
+
+        Al termine, self.n_iter_ contiene il numero di iterazioni di Lloyd's
+        effettivamente eseguite (aggiornamenti dei centroidi completati).
         """
 
         centroids_arr = np.vstack(self.starting_centroids)
@@ -178,7 +215,7 @@ class kmeans_parallel():
             self.cost_history_ = []
             self.iter_times_ = []
 
-        for _ in range(max_iter):
+        for iteration in range(max_iter):
             iter_start = time.time()
 
             if track_convergence:
@@ -219,7 +256,15 @@ class kmeans_parallel():
             for cluster_idx, p_mean in reduced.items():
                 new_centroids[cluster_idx] = p_mean
 
+            if len(reduced) < self.k:
+                warnings.warn(
+                    f"{self.k - len(reduced)} cluster vuoti dopo l'assegnazione: "
+                    "i centroidi corrispondenti restano al valore dell'iterazione precedente"
+                )
+
             self.final_centroids = new_centroids
+            # numero di update di Lloyd's completati
+            self.n_iter_ = iteration + 1
 
             if track_convergence:
                 self.iter_times_.append(time.time() - iter_start)
