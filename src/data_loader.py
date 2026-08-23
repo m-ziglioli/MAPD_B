@@ -18,11 +18,12 @@ def _count_lines_gz(filepath):
             count += 1
     return count
 
-def load_dataset(dataset_url, raw_gz_path, parquet_path, parquet_path_workers, col_names, n_partitions=4, client=None): # Local path on each worker's disk 
+def load_dataset(dataset_url, raw_gz_path, parquet_path, parquet_path_workers, col_names, n_partitions=4, client=None, force_download=False): # Local path on each worker's disk 
                                   # has to be the same as master's, otherwise metadata issues 
     """
-    1. Master downloads the .gz file, converts it to a Parquet file,
-    separated into chunks of the specified size (total size / number of partitions).
+    1. Master downloads the .gz file (skipped if raw_gz_path already exists,
+       unless force_download=True), converts it to a Parquet file,
+       separated into chunks of the specified size (total size / number of partitions).
 
     Then the Parquet dataset is converted to a distributed Dask bag of NumPy arrays. Steps:
       2. Read Parquet with Dask – workers read row groups in parallel.
@@ -32,8 +33,11 @@ def load_dataset(dataset_url, raw_gz_path, parquet_path, parquet_path_workers, c
     os.makedirs("./data", exist_ok=True)
 
     # --- Download GZ file---
-    print("Downloading compressed dataset...")
-    urllib.request.urlretrieve(dataset_url, raw_gz_path)
+    if force_download or not os.path.exists(raw_gz_path):
+        print("Downloading compressed dataset...")
+        urllib.request.urlretrieve(dataset_url, raw_gz_path)
+    else:
+        print(f"Using cached dataset: {raw_gz_path}")
 
     # --- Convert to Parquet---
     n_total_rows = _count_lines_gz(raw_gz_path)
@@ -95,8 +99,9 @@ def load_dataset(dataset_url, raw_gz_path, parquet_path, parquet_path_workers, c
     # Apply scaling partition‑wise (workers do the work)
     feature_cols = list(ddf.columns)   # these are the names of the remaining (numeric) columns
     ddf = ddf.map_partitions(lambda df: (df - mean) / std,
-                             meta={c: float for c in feature_cols})
-                             # keep column names as metadata
+                             meta={c: 'float64' for c in feature_cols})
+                             # keep column names as metadata (dtype come stringa,
+                             # non tipo python: meta deve essere spec pandas valido)
     
     # --- 4. Convert to Dask bag of NumPy arrays ---
     # because this is what is used in Analysis notebook 

@@ -47,7 +47,6 @@ SCHEDULER_OPTIONS = {
 # si connettano allo scheduler. Alcuni nodi possono impiegare più tempo per
 # via di import pesanti nell'ambiente virtuale remoto o latenza SSH.
 DEFAULT_STARTUP_TIMEOUT = 30.0
-POLL_INTERVAL = 5.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,9 +85,9 @@ def launch_cluster(n_workers: int, block: bool = False, startup_timeout: float =
     da notebook (bloccherebbe la cella per sempre).
 
     startup_timeout: secondi massimi di attesa per la connessione di tutti
-    i worker richiesti. Se allo scadere del timeout non tutti sono
-    connessi, viene stampato un avviso esplicito (non silenzioso) e si
-    procede comunque con quelli disponibili.
+    i worker richiesti (passati a Client.wait_for_workers). Se allo scadere
+    del timeout non tutti sono connessi, viene stampato un avviso esplicito
+    (non silenzioso) e si procede comunque con quelli disponibili.
     """
 
     if not (1 <= n_workers <= len(WORKER_IPS)):
@@ -113,7 +112,20 @@ def launch_cluster(n_workers: int, block: bool = False, startup_timeout: float =
     )
 
     client = Client(cluster)
-    print("Cluster avviato e connessione stabilita con successo!\n")
+
+    # Attesa esplicita dei worker richiesti: prima dell'implementazione di
+    # questo controllo il parametro startup_timeout era accettato ma mai
+    # usato, e il notebook proseguiva (a volte a metà sweep) senza tutti
+    # i nodi. Al timeout si prosegue comunque, ma con avviso visibile.
+    try:
+        client.wait_for_workers(n_workers, timeout=startup_timeout)
+        print("Cluster avviato e connessione stabilita con successo!\n")
+    except TimeoutError:
+        connected = len(client.scheduler_info().get("workers", {}))
+        print(
+            f"\n[AVVISO] Timeout ({startup_timeout:.0f}s): connessi "
+            f"{connected}/{n_workers} worker. Si procede con quelli disponibili."
+        )
 
     if block:
         print("\n[INFO] Il cluster rimarrà attivo finché questo script è in esecuzione.")

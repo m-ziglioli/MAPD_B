@@ -71,6 +71,12 @@ def run_comparison(client, X_bag, k_values, parallel_combinations, seed=42,
         uses 11 for cost tables (median).
     max_iter_fit, tol : Lloyd's stopping criteria, shared by all three
         methods so "final cost" means "cost at convergence" everywhere.
+        NB: the tol SEMANTICS differ slightly between engines -- scikit-learn
+        (serial baselines) scales the threshold by the data variance, while
+        kmeans_parallel.fit uses the raw Frobenius norm of the centroid
+        shift. In practice both stop on strict label stability (no point
+        changes cluster), which dominates for large k, so "final" costs
+        remain comparable; keep this in mind only if comparing n_lloyd_iters.
     n_local_trials : passed to the serial k-means++ seeding (see
         kmeans_serial.compute_starting_centroids).
 

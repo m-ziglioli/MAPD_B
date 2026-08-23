@@ -99,25 +99,31 @@ def plot_cost_by_method(df, metric="cost_final", output_path=None, dpi=150):
     return fig
 
 
-def plot_cost_vs_rounds(df, k, metric="cost_final", output_path=None, dpi=150):
+def plot_cost_vs_rounds(df, k, metric="cost_final", stat="median",
+                        output_path=None, dpi=150):
     """Reproduce paper Figure 5.2/5.3: cost vs number of rounds r for
     k-means||, one line per l/k ratio, with horizontal reference lines for
     the serial k-means++/Random cost at this k. Only meaningful if the
     parallel_combinations used for run_comparison swept r at a fixed
-    l/k ratio."""
+    l/k ratio.
+
+    stat : aggregation over repeated seeds. Default "median" follows the
+    paper's protocol (Bahmani et al. report medians over 11 runs); use
+    "mean" for the old behaviour.
+    """
     sub = df[(df["k"] == k) & (df["method"] == "kmeans||")]
     if sub.empty:
         raise ValueError(f"No kmeans|| rows found for k={k}")
 
     fig, ax = plt.subplots(figsize=(7, 5))
     for l_over_k, group in sub.groupby("l_over_k"):
-        stats = group.groupby("r")[metric].mean().sort_index()
+        stats = group.groupby("r")[metric].agg(stat).sort_index()
         ax.plot(stats.index, stats.values, marker="o", label=f"l/k={l_over_k:g}")
 
     for method, style in (("k-means++", "--"), ("random", ":")):
         baseline_rows = df[(df["k"] == k) & (df["method"] == method)][metric]
         if not baseline_rows.empty:
-            ax.axhline(baseline_rows.mean(), linestyle=style, color="black", label=method)
+            ax.axhline(baseline_rows.agg(stat), linestyle=style, color="black", label=method)
 
     ax.set_xlabel("number of rounds (r)")
     ax.set_ylabel(metric)
