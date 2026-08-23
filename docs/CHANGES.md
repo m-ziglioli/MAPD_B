@@ -1,5 +1,78 @@
 # Changelog
 
+## 2026-08-23 — Review round 2: media reale sui seed, policy dei round esplicita, stato distribuito
+
+Secondo giro di review critica (post-refactor vettorizzato). Tre difetti
+strutturali e tre maggiori emersi e corretti. Commit `835dfb9` (fix+perf)
+e `cf17263` (chore).
+
+### Correttezza / metodologia
+- **`run_benchmark`: media falsa corretta.** Ogni ripetizione chiamava
+  `run_single_test` con lo STESSO seed ⇒ 10 run bit-identici, media e std
+  privi di significato statistico (errorbar ~0 nei plot). Ora la
+  ripetizione i-esima usa `seed + i`, come già faceva `run_comparison`;
+  il CSV registra la colonna `seed`.
+- **Numero di round risolto in UN punto (`resolve_rounds`).** La regola
+  del paper "l/k <= 0.1 -> 15 round" era duplicata (engine + driver) e
+  silenziamente scartava un `r` esplicito. Ora: `policy="auto"` (default,
+  regola del paper, anche con r fornito — comportamento storico preservato)
+  o `policy="fixed"` (escape hatch esplicito); il round effettivo è
+  registrato come `clf.n_rounds_` e colonna `r_effective` nei CSV di
+  entrambi i driver. Il costruttore accetta ora `r=None` come da docstring.
+- **Igiene RNG.** Due `default_rng(seed_seq)` sulla STESSA SeedSequence
+  duplicavano lo stream: il `random_state` del reclustering condivideva i
+  bit dell'indice del centroide iniziale. Ora `SeedSequence(seed).spawn(3)`
+  separa centroide iniziale / round di campionamento / reclustering; i
+  seed per (partizione, round) sono pre-derivati con `spawn` (eliminato
+  l'hack `entropy % 2**32`, che collideva per seed a distanza 2^32).
+  NOTA: cambia il campionamento a parità di seed rispetto al giro prima
+  (intenzionale; i golden di fit partono da centroidi fissi e non sono
+  toccati).
+- **`run_single_test`**: catturato SOIL il `ValueError` noto del
+  reclustering con candidati < k (verifica sul messaggio); ogni altro
+  errore propaga invece di comparire come riga "FAILED".
+
+### Scalabilità (stato fuori dal client)
+- **Partizioni materializzate una sola volta** (`_persist_matrices`):
+  seeding e fit riusano gli stessi futures; niente ri-vstack delle
+  partizioni del bag a ogni round/iterazione (~2r+2 passaggi evitati).
+- **Stato k-means|| (m,2) sempre lato worker**: catena di Delayed tra i
+  round; `_update_state` fonde lo scalare di costo del round. Al client
+  arrivano solo scalari e i k-vettori dei pesi finali. Prima: la matrice
+  di stato completa viaggiava client↔cluster ad ogni round (decine di MB
+  su KDD full).
+- **Etichette di Lloyd's nel grafo**: `fit()` calcola solo le riduzioni
+  `t[:4]` (somme k×d, conteggi, costo, cambiamenti); le etichette `t[4]`
+  restano nel grafo come input dell'iterazione successiva. Prima: vettori
+  (m,) int32 su e giù dal client ad ogni iterazione.
+- Guardie d'uso (`RuntimeError` chiaro se `fit`/`classify`/`inertia`
+  chiamate fuori ordine) e deduplicazione inertia (`inertia_of_bag`
+  condivisa da classe e benchmark).
+
+### Altro (chore)
+- `launch_cluster`: `startup_timeout` era accettato ma mai usato; ora
+  passato a `Client.wait_for_workers`, con avviso esplicito se si procede
+  con meno worker. Rimosso `POLL_INTERVAL` morto.
+- `data_loader`: download saltato se il .gz esiste già
+  (`force_download=True` per rifarlo); meta dtype come stringhe
+  `'float64'` invece del tipo python.
+- `comparison_analysis.plot_cost_vs_rounds`: aggregazione `stat="median"`
+  di default (protocollo del paper; `"mean"` disponibile).
+- `kmeans_comparison`: nota su differenza di semantica di `tol` fra
+  sklearn e il nostro Lloyd's (irrilevante grazie alla stop stretta sulle
+  etichette, documentata per onestà).
+- Harness locale: smoke_test esteso (variazione seed, policy dei round,
+  guardie d'uso); rimossa la nota stale sulla non-riproducibilità del seed.
+
+### Verifica
+- smoke_test verde: regression golden bit-identica, determinismo intatto,
+  costo finale invariato (672313.9799 su bench_timing locale).
+- Driver verificati end-to-end su LocalCluster (seed variati, colonne
+  nuove, guardie).
+- **Pendente validazione su cluster SSH**: sweep piccolo (k=500/1000,
+  4 combinazioni del notebook) per confermare il guadagno temporale del
+  nuovo schema di stato su dati/partizioni reali.
+
 ## 2026-08-23 — Determinismo del seeding + engine vettorizzato per-partizione
 
 Il bug di non-riproducibilità del seed (vedi 2026-07-19) è **risolto**, e

@@ -30,20 +30,23 @@ from `notebooks/analysis.ipynb`:
    - returns a **Dask Bag of 1-D NumPy arrays** (one row per element) plus
      the `(mean, std)` used for scaling.
 3. **k-means|| + Lloyd's** — `src.kmeans_parallel.kmeans_parallel`:
-   - `compute_starting_centroids(X_bag, seed, ...)`: Algorithm 2 of the
-     paper. Uniform initial center; per round, each point is sampled with
-     Bernoulli probability `min(1, l*d2(x,C)/phi_X(C))` (a `filter` over a
-     zipped bag); a per-point "state" bag of `(min_d2, nearest_center_idx)`
-     is persisted each round; after `r` rounds the candidate pool is
-     reclustered to `k` centers with a weighted scikit-learn KMeans
-     (n_init=1, k-means++ init) on the client.
-   - `fit(X_bag, ...)`: distributed Lloyd's. Each iteration maps every
-     point to `(nearest_center_idx, point)`, `foldby`-aggregates
-     per-cluster sums/counts (and cost, if `track_convergence=True`),
-     recomputes centroids, and stops when no label changes or the centroid
-     shift < `tol`.
-   - `classify` / `inertia`: nearest-center label and phi_X(C) for the
-     final centroids.
+    - `compute_starting_centroids(X_bag, seed, ...)`: Algorithm 2 of the
+      paper. Uniform initial center; per round, each point is sampled with
+      Bernoulli probability `min(1, l*d2(x,C)/phi_X(C))`; a per-partition
+      "state" matrix `(m, 2)` of `(min_d2, nearest_center_idx)` is chained
+      through delayed tasks and stays worker-side (only round-cost scalars
+      reach the client); after `r` rounds (resolved by `resolve_rounds`,
+      recorded in `n_rounds_` / CSV column `r_effective`) the candidate
+      pool is reclustered to `k` centers with a weighted scikit-learn KMeans
+      (n_init=1, k-means++ init) on the client.
+    - `fit(X_bag, ...)`: distributed Lloyd's on persisted partition
+      matrices. Each iteration runs one vectorized task per partition that
+      returns only small reductions (`k×d` sums, counts, cost,
+      label-changed count); the per-point labels stay in the task graph as
+      input of the next iteration. Stops when no label changes or the
+      centroid shift < `tol`.
+    - `classify` / `inertia`: nearest-center label and phi_X(C) for the
+      final centroids (inertia shares `inertia_of_bag` with benchmark.py).
 4. **Baselines** — `src.kmeans_serial.kmeans_serial` (client-side,
    scikit-learn): `kmeans_plusplus` seeding or uniform random, then
    sklearn `KMeans` Lloyd's with `n_init=1` from those centers.
@@ -68,15 +71,20 @@ from `notebooks/analysis.ipynb`:
 
 - **Scatter-based bag construction** (`_build_bag`): data moves to workers
   once per partition count, not through the task graph. Correct choice.
-- **Persisted per-round state** in k-means||: the `(min_d2, idx)` state is
-  materialized once per round, so rounds do not recompute history.
+- **Persisted partition matrices + distributed state** (2026-08-23 round 2):
+  partition matrices are materialized once per call (`_persist_matrices`);
+  the k-means|| state and Lloyd's labels never travel to the client — only
+  scalars and `k×d` blocks cross the network.
 - **Reclustering on the client** (weighted KMeans on O(r*l) candidates):
   matches the paper's Step 8 and keeps the heavy work distributed.
 - **Strict convergence check** in `fit()` (no label change) — matches
   Lloyd's definition and sklearn behavior; the earlier centroid-shift-only
   criterion stalled for large k.
-- **Cost computed inside the foldby** when tracking convergence: no extra
-  pass over the data.
+- **Cost computed inside the assignment pass** when tracking convergence:
+  no extra pass over the data.
+- **Real seed averaging in both drivers**: repetition i uses `seed + i`,
+  effective rounds recorded (`r_effective`), so cost statistics across
+  repetitions are meaningful.
 
 ### Bottleneck: row-granular Bag + per-point Python lambdas
 
@@ -142,6 +150,35 @@ with the out-of-core loader, to the dedicated next phase.
    STILL OPEN — moves to the out-of-core phase (together with conditional
    `persist` and per-worker sharding).
 
+### Review round 2 (2026-08-23, commits `835dfb9` + `cf17263`) — all RESOLVED
+
+7. **Fake averaging in `run_benchmark`**: every repetition reused the same
+   seed ⇒ bit-identical runs, meaningless mean/std. **RESOLVED**: repetition
+   i uses `seed + i`; `seed` column recorded in CSVs.
+8. **Silent `r` override, duplicated in two layers**: `l/k<=0.1 ⇒ 15` was
+   applied both in the engine and in the driver, discarding an explicit
+   `r`. **RESOLVED**: single `resolve_rounds()` (`policy="auto"` keeps the
+   paper rule as historical default; `"fixed"` bypasses it); drivers record
+   the effective rounds (`n_rounds_` / CSV column `r_effective`).
+9. **Duplicate RNG stream**: two Generators on the same `SeedSequence`
+   duplicated the stream (reclustering `random_state` shared bits with the
+   initial-centroid draw); `entropy % 2**32` collided for seeds 2^32 apart.
+   **RESOLVED**: `spawn(3)` tree + pre-derived per-(partition, round)
+   sequences. NB: sampling changes at equal seed vs round 1 (intentional;
+   fit golden fixtures unaffected).
+10. **Client-side state ping-pong**: full `(m,2)` state matrices (seeding)
+    and `(m,)` label vectors (Lloyd's) crossed client↔cluster every
+    round/iteration. **RESOLVED**: chained Delayed state, fused cost scalar,
+    labels kept in-graph (`t[4]`); partition matrices persisted once.
+11. **Broad `except ValueError`** masking real bugs as "FAILED" rows.
+    **RESOLVED**: only the known too-few-candidates reclustering error is
+    caught (message-checked); everything else propagates.
+12. Minor batch: unused `startup_timeout`/dead `POLL_INTERVAL`
+    (now enforced via `wait_for_workers`), unconditional dataset download
+    (cached), `meta` dtype-as-type (now `'float64'`), mean-instead-of-median
+    in Fig-5.x plots (now `stat="median"` default), missing usage guards
+    (added `RuntimeError`s), inertia duplication (shared `inertia_of_bag`).
+
 ### Optimality verdict
 
 The *algorithm* implements the paper faithfully (Bernoulli sampling,
@@ -162,7 +199,7 @@ Reference: `docs/1203.6402v1.pdf`. Partition baseline excluded per plan.
 |---|---|---|
 | Table 3 (KDD full cost) | k in {500,1000}, r=5, l in {0.1k,0.5k,k,2k,10k} + Random; cost x1e-10; median protocol | Covered by `run_comparison`-style sweep on full KDD; needs cluster run |
 | Table 4 (times) | init + Lloyd time per method (Hadoop) | Adapted: same table structure measured on our Dask cluster (not comparable to paper's absolute numbers) |
-| Table 6 (Lloyd iterations, Spam) | k in {20,50,100}; Random / k-means++ / k-means||(0.5k,5) / (2k,5); avg over 10 runs | **Missing**: Spam dataset loader; `fit()` does not expose iteration count |
+| Table 6 (Lloyd iterations, Spam) | k in {20,50,100}; Random / k-means++ / k-means||(0.5k,5) / (2k,5); avg over 10 runs | **Missing**: Spam dataset loader; iteration count exposed (`n_iter_`, plus `n_rounds_` for seeding rounds) |
 | Fig 5.1 (cost vs rounds, KDD 10%) | k in {17,33,65,129}, l/k in {1,2,4}, r = 1..10, **exactly l samples per round** (joint distribution), median of 11 runs | **Missing**: exact-l sampling mode (we only have Bernoulli) |
 | Fig 5.2 (cost vs rounds, GaussMixture) | n=10k, 15-dim, R in {1,10,100}, l/k in {0.1,..,10}, r = 0..15, k-means++ horizontal reference | **Missing**: GaussMixture generator; r=0 must degrade to uniform random k centers |
 
