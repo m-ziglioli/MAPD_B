@@ -1,5 +1,56 @@
 # Changelog
 
+## 2026-08-24 — Incidente cluster: worker senza freeze → KilledWorker. Causa, fix, prevenzione
+
+### Catena causale completa
+
+1. I worker erano stati **riprovisionati senza i pacchetti del freeze**
+   (sklearn assente dal pyvenv dei worker; dask/numpy/pandas/pyarrow
+   presenti — per questo il caricamento dati funzionava).
+2. I task del motore referenziano funzioni di `src.kmeans_parallel` e la
+   serializzazione di default è **by-reference**: per eseguire il task il
+   worker deve importare il MODULO, e l'import di `src.kmeans_parallel`
+   richiede sklearn (linea 39) → `ModuleNotFoundError` sul worker.
+3. In distributed 2026.6.0 quell'errore durante l'esecuzione fa **crashare
+   il processo worker** (non marca solo il task) → nanny riavvia, dask
+   riprova su altri worker → `KilledWorker`, e churn della popolazione
+   ("already forgotten", probe che vedeva 4 worker su 8).
+4. Il `.pth` sul HEAD aveva sistemato solo lo SCHEDULER (che sta sul head):
+   i worker sono VM separate e non avevano né la repo né sklearn.
+
+Perché prima non si vedeva: fino al refactor i task erano lambda definite
+nei notebook (by-value), mai import di `src` sul worker; il primo grafo che
+referenzia `src` è arrivato con `_persist_matrices` (2026-08-23).
+
+### Fix (due scudi indipendenti)
+
+- **Scudo 1 — codice che viaggia col grafo** (commit `964359f`):
+  `launch_cluster()` registra by-value i moduli `src.*` subito dopo la
+  connessione: i task non richiedono più import di moduli sul worker.
+  Verificato localmente: funzioni task unpicklano in un processo senza
+  `src` importabile.
+- **Scudo 2 — worker con repo e freeze allineati** (nuovo
+  `scripts/sync_workers.py`): deploy di `src/` + `requirements.txt` su tutti
+  gli 8 worker + file `.pth` nel site-packages del pyvenv remoto (path
+  derivato a runtime, non hardcodato su python3.10) + opzione `--install`
+  per allineare i pacchetti. Da rieseguire dopo ogni `git pull` di codice
+  nuovo.
+
+### Prevenzione
+
+- Nuovo `scripts/check_cluster_env.py`: probe one-shot (via `client.run`,
+  senza `get_worker`) delle versioni freeze su TUTTI i worker con verdetto
+  di allineamento. Da eseguire subito dopo ogni avvio cluster, o standalone
+  con `--address`.
+- Regole operative documentate: non riavviare MAI il kernel con un cluster
+  vivo (le sessioni SSH muoiono e portano giù i processi remoti); pulire
+  scheduler orfani sulla porta 8786 prima di `launch_cluster`.
+
+### Stato
+
+B1 (validazione storica) in corso sul VM head una volta che
+`check_cluster_env` è verde su tutti gli 8 worker.
+
 ## 2026-08-23 — Fase A (prerequisiti articolo): random baseline r=0, sampling esatto, driver paper
 
 Prerequisiti del piano congelato `docs/ANALYSIS_PLAN.md`, implementati e
