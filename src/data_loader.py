@@ -102,12 +102,21 @@ def load_dataset(dataset_url, raw_gz_path, parquet_path, parquet_path_workers, c
                              meta={c: 'float64' for c in feature_cols})
                              # keep column names as metadata (dtype come stringa,
                              # non tipo python: meta deve essere spec pandas valido)
+
+
     
     # --- 4. Convert to Dask bag of NumPy arrays ---
-    # because this is what is used in Analysis notebook 
-    X_bag = ddf.to_bag(index=False).map(
-    lambda row: np.array(row, dtype=np.float64)
-    )
+    # because this is what is used in notebooks
+    #X_bag = ddf.to_bag(index=False).map(
+    #lambda row: np.array(row, dtype=np.float64)
+    #)
+    def part_to_array(df):
+        return df.to_numpy(dtype=np.float64)
+    arrays = ddf.map_partitions(part_to_array, meta=np.array([])) # map_partitions is designed for DataFrame-like results; we're repurposing it to hold arrays
+    X_bag = db.from_delayed(arrays.to_delayed())
+
+
+    
     # final number of partitions might be smaller because dropna() might fuse small partitions
     print(f"Distributed bag created with {X_bag.npartitions} partitions.")
     print("Number of samples:", ddf.shape[0].compute())

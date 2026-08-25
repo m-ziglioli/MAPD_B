@@ -75,7 +75,8 @@ def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X
 def run_benchmark(client, X_bag=None, combinations=None, k_values=None,
                   label="benchmark", max_iter_fit=10, seed=42,
                   averaging_iterations=10, X_arr=None):
-    """Esegue una griglia di test mantenendo i dati distribuiti su Dask."""
+    """Esegue una griglia di test mantenendo i dati distribuiti su Dask.
+    Varia n_workers, num_partitions, l_over_k, r. """
     if X_bag is None and X_arr is None:
         raise ValueError("run_benchmark: fornire X_bag oppure X_arr")
 
