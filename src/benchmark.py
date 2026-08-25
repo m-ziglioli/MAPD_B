@@ -72,16 +72,23 @@ def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X
     return result, X_bag
 
 
-def run_benchmark(client, X_bag=None, combinations=None, k_values=None,
-                  label="benchmark", max_iter_fit=10, seed=42,
-                  averaging_iterations=10, X_arr=None):
+def run_benchmark(client, X_bag=None, combinations=None, k_values=None, label="benchmark",
+                   max_iter_fit=10, seed=42, averaging_iterations=10, X_arr=None):
     """Esegue una griglia di test mantenendo i dati distribuiti su Dask.
-    Varia n_workers, num_partitions, l_over_k, r. """
+    Varia n_workers, num_partitions, l_over_k, r.
+    Salva ogni singolo risultato su CSV subito dopo il calcolo (append),
+    cosi' che se l'esecuzione si interrompe nessun risultato gia' calcolato viene perso.
+    """
     if X_bag is None and X_arr is None:
         raise ValueError("run_benchmark: fornire X_bag oppure X_arr")
 
     # Mantiene i dati distribuiti sui worker ed evita OOM/0-d array errors
-    base_bag = _build_bag(client, X_arr, combinations[0][1]) if X_bag is None else X_bag.map_partitions(lambda p: np.array(list(p)))
+    base_bag = build_bag(client, X_arr, combinations[0][1]) if X_bag is None else X_bag.map_partitions(lambda p: np.array(list(p)))
+
+    # Prepara il file CSV una sola volta, prima di iniziare i test
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    csv_path = os.path.join(RESULTS_DIR, f"{label}{time.strftime('%Y%m%d%H%M%S')}.csv")
+    csv_initialized = False
 
     results = []
     current_workers, current_partitions, current_bag = None, None, base_bag
@@ -90,15 +97,15 @@ def run_benchmark(client, X_bag=None, combinations=None, k_values=None,
         for n_workers, num_partitions, l_over_k, r in combinations:
             if n_workers != current_workers:
                 current_workers, current_partitions = n_workers, None
-
             if num_partitions != current_partitions:
-                current_bag = _build_bag(client, X_arr, num_partitions) if X_arr is not None else base_bag.repartition(npartitions=num_partitions)
+                current_bag = build_bag(client, X_arr, num_partitions) if X_arr is not None else base_bag.repartition(npartitions=num_partitions)
                 current_partitions = num_partitions
 
             l = max(1, round(l_over_k * k))
             print(f"Testing: k={k}, workers={n_workers}, partitions={num_partitions}, l={l} (l/k={l_over_k}), r={r}\n Iterating {averaging_iterations} times.")
 
             for i in range(averaging_iterations):
+                print(f"Iteration {i}")
                 result, current_bag = run_single_test(
                     client, k=k, l=l, r=r, num_partitions=num_partitions,
                     max_iter_fit=max_iter_fit, seed=seed + i, X_bag=current_bag
@@ -106,16 +113,23 @@ def run_benchmark(client, X_bag=None, combinations=None, k_values=None,
                 result.update({"workers": n_workers, "l_over_k": l_over_k})
                 results.append(result)
 
+                # Salva subito questo singolo risultato (append su CSV)
+                df_row = pd.DataFrame([result])
+                df_row.to_csv(
+                    csv_path,
+                    mode="a",
+                    header=not csv_initialized,
+                    index=False
+                )
+                csv_initialized = True
+
     df_results = pd.DataFrame(results)
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    csv_path = os.path.join(RESULTS_DIR, f"{label}_{time.strftime('%Y%m%d_%H%M%S')}.csv")
-    df_results.to_csv(csv_path, index=False)
-    print(f"\nRisultati salvati in: {csv_path}\n--- Benchmark Complete ---")
-    
+    print(f"\nRisultati completi salvati in: {csv_path}\n--- Benchmark Complete ---")
+
     for res in sorted(results, key=lambda x: (x["cost"] is None, x["cost"])):
         print(res)
 
-    return df_results
+    return df_resultss
 
 
 def run_worker_sweep(X_bag_or_arr, workers_list, combinations_fn, k_values,
