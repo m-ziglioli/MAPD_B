@@ -15,7 +15,7 @@ import pandas as pd
 
 from src.kmeans_parallel import inertia_of_bag, kmeans_parallel
 
-RESULTS_DIR = "results"
+RESULTS_DIR = "../results"
 
 
 def _build_bag(client, X, num_partitions):
@@ -126,11 +126,17 @@ def run_benchmark(client, X_bag=None, combinations=None, k_values=None, label="b
     df_results = pd.DataFrame(results)
     print(f"\nRisultati completi salvati in: {csv_path}\n--- Benchmark Complete ---")
 
-    for res in sorted(results, key=lambda x: (x["cost"] is None, x["cost"])):
+    for res in sorted(results, key=lambda x: (x.get("final_cost") is None, x.get("final_cost"))):
         print(res)
 
-    return df_resultss
+    return df_results
 
+
+def combinations_fn(n_workers, l_over_k, r):
+    # Each tuple: (n_workers, num_partitions, l_over_k, r)
+    return [
+    (n_workers, 8 * n_workers, l_over_k, r),
+    ]
 
 def run_worker_sweep(X_bag_or_arr, workers_list, combinations_fn, k_values,
                      label="worker_sweep", max_iter_fit=10, seed=42, averaging_iterations=10):
