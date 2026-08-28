@@ -15,7 +15,7 @@ import pandas as pd
 
 from src.kmeans_parallel import inertia_of_bag, kmeans_parallel
 
-RESULTS_DIR = "../results"
+RESULTS_DIR = "/home/ubuntu/Project/libero_development/results"
 
 
 def _build_bag(client, X, num_partitions):
@@ -52,24 +52,27 @@ def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X
             **({"cost_history": None, "iter_times": None} if track_convergence else {}),
             **({"n_centroids_history": None} if track_centroids else {})
         }, X_bag
-
+    partial_time=time.time()
     clf.fit(X_bag, max_iter=max_iter_fit, track_convergence=track_convergence)
-    elapsed_time = time.time() - start_time
+    end_time=time.time()
+    elapsed_time = end_time - start_time
+    lloyd_time=time.time()-partial_time
+
     cost = calculate_inertia(X_bag, clf.final_centroids)
     initial_cost = calculate_inertia(X_bag, clf.starting_centroids)
     
-    print(f" -> Final cost: {cost:.2f} | Time: {elapsed_time:.2f}s")
+    print(f" -> Final cost: {cost:.2f} | Time: {elapsed_time:.2f}s | Time for LLoyd iterations only: {lloyd_time:.2f}s")
 
     result = {
         "k": k, "l": l, "r": r, "r_effective": getattr(clf, "n_rounds_", None),
-        "partitions": num_partitions, "initial_cost": initial_cost, "final_cost": cost, "time": elapsed_time, "seed": seed
+        "partitions": num_partitions, "initial_cost": initial_cost, "final_cost": cost, "time": elapsed_time, "lloyd_time": lloyd_time, "seed": seed
     }
     if track_convergence:
         result["cost_history"], result["iter_times"] = clf.cost_history_, clf.iter_times_
     if track_centroids:
         result["n_centroids_history"] = clf.n_centroids_history_
-
-    return result, X_bag
+    # can return X_bag because lazy:
+    return result, X_bag 
 
 
 def run_benchmark(client, X_bag=None, combinations=None, k_values=None, label="benchmark",
@@ -83,7 +86,7 @@ def run_benchmark(client, X_bag=None, combinations=None, k_values=None, label="b
         raise ValueError("run_benchmark: fornire X_bag oppure X_arr")
 
     # Mantiene i dati distribuiti sui worker ed evita OOM/0-d array errors
-    base_bag = build_bag(client, X_arr, combinations[0][1]) if X_bag is None else X_bag.map_partitions(lambda p: np.array(list(p)))
+    base_bag = build_bag(client, X_arr, combinations[0][1]) if X_bag is None else X_bag.map_partitions(lambda p: np.array(list(p))) # turn partitions into as many 2-d numpy as partitions arrays, for safety
 
     # Prepara il file CSV una sola volta, prima di iniziare i test
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -102,7 +105,7 @@ def run_benchmark(client, X_bag=None, combinations=None, k_values=None, label="b
                 current_partitions = num_partitions
 
             l = max(1, round(l_over_k * k))
-            print(f"Testing: k={k}, workers={n_workers}, partitions={num_partitions}, l={l} (l/k={l_over_k}), r={r}\n Iterating {averaging_iterations} times.")
+            print(f"Testing: k={k}, workers={n_workers}, partitions={current_bag.npartitions}, l={l} (l/k={l_over_k}), r={r}\n Iterating {averaging_iterations} times.")
 
             for i in range(averaging_iterations):
                 print(f"Iteration {i}")

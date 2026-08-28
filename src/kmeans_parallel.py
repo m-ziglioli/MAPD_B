@@ -101,6 +101,98 @@ def _pairwise_d2(M, C):
     np.maximum(d2, 0.0, out=d2)
     return d2
 
+# NOTE: kmeans parallel code is written such that each machine computes distances etc locally, using numpy etc (no dask subtasks) - this is ok because dataset small and dask approach would probably add overhead (aside from being more complex).
+# Main problem was that materialising full distance matrix on a single machine leads to crashing: for 5 workers (8 partitions per worker), k=100, 4e6 total points, we have 1e7 elements, each 8 Bytes, 8 cores simultaneously ---> 640 MB; then numpy operations can require 3x that ---> about 2 GB more.
+def _pairwise_d2_argmin_chunked(M, C, chunk_k=20):
+    """
+    Calcola, per ogni punto in M, la distanza al quadrato dal centroide
+    più vicino in C - SENZA mai costruire la matrice completa (m, k).
+
+    Perché serve: la versione originale (_pairwise_d2) calcola tutte le
+    distanze in un colpo solo, creando una matrice di dimensione
+    (numero di punti) x (numero di centroidi). Quando k è grande
+    (es. 500-1000) e la partizione è grande, questa matrice puo' pesare
+    diversi GB in memoria - questo e' probabilmente il bug che causava gli out-of-memory.
+
+    Come funziona: invece di guardare tutti i k centroidi insieme,
+    li guardiamo a piccoli gruppi ("chunk") per volta. Per ogni gruppo,
+    calcoliamo le distanze solo verso quel gruppo, e teniamo traccia del
+    miglior risultato visto finora (distanza minima e indice del centroide
+    corrispondente). Alla fine otteniamo lo stesso risultato di prima, ma
+    non abbiamo mai tenuto in memoria più di (m, chunk_k) numeri insieme.
+
+    Parametri
+    ---------
+    M : array (m, d)
+        I punti della partizione (m righe, d feature per riga).
+    C : array (k, d)
+        Tutti i centroidi attuali (k centroidi, d feature ciascuno).
+    chunk_k : int
+        Quanti centroidi considerare per volta. Più piccolo = meno memoria
+        usata ma più iterazioni del ciclo (leggermente più lento).
+        Più grande = più memoria ma meno iterazioni.
+
+    Ritorna
+    -------
+    best_dist : array (m,)
+        Per ogni punto, la distanza al quadrato dal centroide più vicino.
+    best_idx : array (m,) di interi
+        Per ogni punto, l'indice (0-based) del centroide più vicino.
+    """
+    m = M.shape[0]  # numero di punti in questa partizione
+
+    # Se la partizione e' vuota, non c'e' nulla da calcolare.
+    if m == 0:
+        return np.empty(0), np.empty(0, dtype=np.int64)
+
+    # Qui memorizziamo il MIGLIOR risultato trovato finora per ogni punto.
+    # Iniziamo con "infinito" come distanza (cosi' il primo chunk vince
+    # sicuramente) e indice 0 come segnaposto.
+    best_dist = np.full(m, np.inf)
+    best_idx = np.zeros(m, dtype=np.int64)
+
+    # ||x||^2 per ogni punto x in M. Lo calcoliamo una sola volta fuori dal
+    # ciclo perche' non cambia mai (dipende solo da M, non dal centroide).
+    m_sq = np.einsum("ij,ij->i", M, M)
+
+    # Scorriamo i centroidi a gruppi di "chunk_k" alla volta.
+    # Esempio: se k=1000 e chunk_k=100, questo ciclo gira 10 volte.
+    for start in range(0, C.shape[0], chunk_k):
+        # Prendiamo solo il pezzo di centroidi che ci interessa in questo giro.
+        end = start + chunk_k
+        C_chunk = C[start:end]  # forma: (fino a chunk_k, d)
+
+        # ||c||^2 per ogni centroide in questo chunk.
+        c_sq = np.einsum("ij,ij->i", C_chunk, C_chunk)
+
+        # Distanza al quadrato fra ogni punto di M e ogni centroide del chunk:
+        # ||x - c||^2 = ||x||^2 + ||c||^2 - 2 * (x . c)
+        # Questa matrice ha forma (m, chunk_k) — MOLTO più piccola della
+        # matrice completa (m, k) che causava il problema di memoria.
+        d2_chunk = m_sq[:, None] + c_sq[None, :] - 2.0 * (M @ C_chunk.T)
+
+        # Piccoli errori di arrotondamento float possono dare valori
+        # leggermente negativi invece di 0: li correggiamo.
+        np.maximum(d2_chunk, 0.0, out=d2_chunk)
+
+        # Per ogni punto, qual e' il centroide migliore DENTRO QUESTO CHUNK?
+        local_best_idx = d2_chunk.argmin(axis=1)          # indice locale (0..chunk_k-1)
+        local_best_dist = d2_chunk[np.arange(m), local_best_idx]  # distanza corrispondente
+
+        # Confrontiamo con il migliore trovato finora (nei chunk precedenti).
+        # "is_better" e' True per i punti dove QUESTO chunk ha un centroide
+        # piu' vicino di quanto trovato prima.
+        is_better = local_best_dist < best_dist
+
+        # Aggiorniamo solo i punti per cui abbiamo trovato qualcosa di meglio.
+        best_dist[is_better] = local_best_dist[is_better]
+        # Attenzione: local_best_idx e' relativo al chunk (parte da 0),
+        # quindi dobbiamo sommare "start" per ottenere l'indice vero nel
+        # vettore completo dei k centroidi.
+        best_idx[is_better] = local_best_idx[is_better] + start
+
+    return best_dist, best_idx
+
 
 def _lloyd_pass(M, prev_labels, C):
     """Una iterazione di assegnazione Lloyd's su una partizione.
@@ -114,12 +206,26 @@ def _lloyd_pass(M, prev_labels, C):
     if M.shape[0] == 0:
         return (np.zeros((k, C.shape[1])), np.zeros(k, dtype=np.int64),
                 0.0, 0, np.empty(0, dtype=np.int32))
-    d2 = _pairwise_d2(M, C)
-    labels = d2.argmin(axis=1)
+
+        
+    #d2 = _pairwise_d2(M, C)
+    #labels = d2.argmin(axis=1)
+    #sums = np.zeros((k, M.shape[1]))
+    #np.add.at(sums, labels, M)
+    #counts = np.bincount(labels, minlength=k).astype(np.int64)
+    #cost = float(d2[np.arange(M.shape[0]), labels].sum())
+
+    # Usiamo la versione "a chunk" per non costruire mai la matrice
+    # completa (m, k) delle distanze, che 
+    # puo' occupare diversi GB e causare out-of-memory.
+    best_dist, labels = _pairwise_d2_argmin_chunked(M, C)
     sums = np.zeros((k, M.shape[1]))
     np.add.at(sums, labels, M)
     counts = np.bincount(labels, minlength=k).astype(np.int64)
-    cost = float(d2[np.arange(M.shape[0]), labels].sum())
+    # best_dist contiene gia' la distanza al centroide assegnato per ogni
+    # punto: la sommiamo direttamente, senza dover rileggere da d2.
+    cost = float(best_dist.sum())
+    
     if prev_labels is None:
         changed = int(M.shape[0])
     else:
@@ -203,15 +309,18 @@ def _update_state(M, state, new_centroids, start_idx):
     del round e' fuso nell'aggiornamento, cosicche' attraverso il confine
     client/cluster passa solo lo scalare e non la matrice di stato.
     """
+    # for debugging:
+    print(f"M: {M.shape}, {M.nbytes/1e6:.1f} MB | "
+          f"state: {state.shape}, {state.nbytes/1e6:.1f} MB | "
+          f"new_centroids: {new_centroids.shape}, {new_centroids.nbytes/1e6:.1f} MB")
+    
     if M.shape[0] == 0 or new_centroids.shape[0] == 0:
         return state, float(state[:, 0].sum())
-    d2_new = _pairwise_d2(M, new_centroids)
-    min_new_idx = d2_new.argmin(axis=1)
-    min_new_dist = d2_new[np.arange(M.shape[0]), min_new_idx]
-    closer = min_new_dist < state[:, 0]
+    best_dist, best_idx = _pairwise_d2_argmin_chunked(M, new_centroids)
+    closer = best_dist < state[:, 0]
     out = state.copy()
-    out[closer, 0] = min_new_dist[closer]
-    out[closer, 1] = (min_new_idx[closer] + start_idx).astype(state[:, 1].dtype)
+    out[closer, 0] = best_dist[closer]
+    out[closer, 1] = (best_idx[closer] + start_idx).astype(state[:, 1].dtype)
     return out, float(out[:, 0].sum())
 
 

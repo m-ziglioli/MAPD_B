@@ -30,7 +30,7 @@ def load_dataset(dataset_url, raw_gz_path, parquet_path, parquet_path_workers, c
       3. Preprocess: drop categorical columns, scale numeric features.
       4. Return a Dask bag where each element is a 1-D array of features.
     """
-    os.makedirs("./data", exist_ok=True)
+    #os.makedirs("./data", exist_ok=True)
 
     # --- Download GZ file---
     if force_download or not os.path.exists(raw_gz_path):
