@@ -1,5 +1,89 @@
 # Changelog
 
+## 2026-08-30 — Refactor pipeline dati: shard Parquet per worker + dask.array (basta bag di righe)
+
+Sostituito il contratto "bag di righe" con **shard Parquet per worker +
+`dask.array` di matrici 2D**, eliminando gli ultimi colli di bottiglia di
+memoria sul master e sul 100% del KDD.
+
+### `src/data_loader.py` (riscritto)
+
+1. Download `.gz` in cache (invariato).
+2. **Conversione `.gz` → N shard Parquet in streaming sul master**
+   (`pd.read_csv(chunksize=...)` → `pq.write_table(snappy)`): il master non
+   tiene mai l'intero dataset in RAM. Rimosso il vecchio dump single-file
+   `f.read()` + broadcast via `client.run` (ogni worker si copiava TUTTO il
+   parquet).
+3. Ogni shard scatterato a UN worker round-robin (`client.scatter(bytes)`):
+   nessun worker tiene l'intero dataset, nessuna copia su disco dei worker.
+4. **Preprocessing in due passate sui worker** (stessa semantica della
+   pipeline ddf precedente: drop `protocol_type/service/flag/label`,
+   `to_numeric(errors="coerce")`, `dropna`, drop colonne costanti via
+   min==max globali; standardizzazione con std campionaria ddof=1):
+   - pass 1: statistiche ridotte per shard (count/sum/sumsq/min/max) →
+     medie/std/min/max globali + colonne costanti;
+   - pass 2: matrice standardizzata `(m_i, d)` per shard.
+5. Ritorna `(X_da, (mean_series, std_series))` dove `X_da` è una
+   `dask.array` `(n, d)` **con shape nota** (le conte per shard arrivano
+   dalla passata 1): un chunk = matrice per shard, quindi `.shape`,
+   `.nbytes`, slicing e riduzioni dask funzionano lato notebook.
+6. `array_to_bag` → `array_to_dask` (stesso formato: un chunk 2D per
+   partizione).
+
+Note d'implementazione (insidie dask verificate in locale):
+
+- `da.from_delayed` non accetta liste: ogni shard va avvolto singolarmente e
+  poi `da.concatenate(axis=0)` (helper `_delayed_matrices_to_array`).
+- Le shape dei chunk DEVONO essere note: con `(np.nan, d)` dask tratta i
+  chunk sconosciuti come grandezza 1 in concatenate/slicing → risultati
+  silenziosamente sbagliati.
+- `Array.to_delayed()` ritorna un **ndarray annidato sulla griglia dei
+  chunk**, non una lista piatta come bag/dataframe: va appiattito con
+  `.ravel().tolist()` prima di consumarlo.
+- `_count_lines_gz` apre con `newline="\n"`: in modalità default su file con
+  fine riga `\r\n` (Windows) conta le righe il doppio → metà shard scritti.
+  Sul cluster Linux non si manifestava; fix per robustezza.
+
+### `src/kmeans_parallel.py`
+
+- `_bag_to_matrices` generalizzata: accetta `dask.array` (chunk 2D usati tal
+  quali, lista appiattita) oppure bag di righe (backward-compat per
+  `agents/smoke_test.py`).
+- Rimosso print di debug in `_update_state`.
+
+### `src/benchmark.py`
+
+- `RESULTS_DIR` di nuovo relativo (`results/`), non più hardcodato al path
+  del VM.
+- `_build_bag` ritorna una dask.array scatterata (finito il bug `build_bag`
+  NameError); `run_benchmark` materializza `X_arr` lato client UNA volta e
+  ri-scattera per ogni numero di partizioni (niente bag `.repartition()`),
+  cancellando il bag precedente con `client.cancel`.
+- Schema risultati unificato anche sul path di fallimento seeding
+  (`initial_cost`/`final_cost`/`lloyd_time` = None invece di `cost`).
+
+### `src/kmeans_comparison.py`, `src/paper_experiments.py`
+
+- `_materialize_bag` lavora su dask.array (chunk 2D appiattiti, vstack sul
+  client); `array_to_dask` per il GaussMixture. Schema risultati invariato
+  (`cost_seed`/`cost_final`/`n_lloyd_iters`).
+
+### Notebook
+
+- `analysis.ipynb`: celle diagnostiche convertite a riduzioni dask.array
+  (`np.isnan(X).any()`, `X.sum(axis=0)`, `X.partitions[0]`, `.nbytes`);
+  `n_points`/`n_features` ora sono metadati (`X.shape`), zero compute; fix
+  refuso `X_bag.npartitions` → `X_bag_full.npartitions`.
+- `comparison.ipynb`, `paper_reproduction.ipynb`, `run.ipynb`: `PARQUET_PATH`
+  → directory shard, import `array_to_dask`.
+
+Compatibilità: i risultati KDD a seed fisso cambiano leggermente (i confini
+di partizione non sono più quelli del bag), la regression golden sintetica
+non cambia. Validato in locale: e2e con `distributed.Client(processes=False)`
+su dataset sintetico schema-KDD (sharding 4 shard, drop costante, 800 punti
+ricostruiti, `run_single_test`/`run_benchmark`/`run_comparison` verdi) +
+smoke test (determinismo e golden OK).
+
 ## 2026-08-24 — Incidente cluster: worker senza freeze → KilledWorker. Causa, fix, prevenzione
 
 ### Catena causale completa
