@@ -41,7 +41,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from src.benchmark import RESULTS_DIR
-from src.data_loader import array_to_dask, make_gauss_mixture
+from src.data_loader import array_to_bag, make_gauss_mixture
 from src.kmeans_parallel import kmeans_parallel, inertia_of_bag
 from src.kmeans_serial import kmeans_serial
 
@@ -171,7 +171,7 @@ def run_fig52(client=None, R_values=(1, 10, 100),
     for R in R_values:
         gm_seed = seed + int(R)
         X, _, _ = make_gauss_mixture(n=n, k=k, d=d, R=R, seed=gm_seed)
-        X_bag = array_to_dask(X, n_partitions)
+        X_bag = array_to_bag(X, n_partitions)
 
         if include_kmpp_reference:
             print(f"[fig52] R={R}: riferimento k-means++, {n_runs} run")

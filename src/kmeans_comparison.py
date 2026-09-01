@@ -29,14 +29,13 @@ from src.kmeans_serial import kmeans_serial
 
 
 def _materialize_bag(client, X_bag):
-    """Gather a dask.array of per-partition matrices into a single numpy
-    array on the client. ``to_delayed()`` yields one 2-D chunk per partition
-    (nested ndarray on the chunk grid, flattened here), so only a handful of
-    compact blocks travel over the network."""
-    if isinstance(X_bag, np.ndarray):
-        return X_bag
-    chunks = X_bag.to_delayed().ravel().tolist()
-    partition_futures = client.compute(chunks)
+    """Gather a Dask Bag of per-row arrays into a single numpy array on
+    the client. Each partition is vstack-ed on the worker first, so only
+    a handful of compact blocks travel over the network instead of one
+    tiny object per row (see CHANGES.md for the CommClosedError this
+    avoids)."""
+    delayed_partitions = [dask.delayed(np.vstack)(p) for p in X_bag.to_delayed()]
+    partition_futures = client.compute(delayed_partitions)
     partitions = client.gather(partition_futures)
     return np.vstack(partitions)
 
