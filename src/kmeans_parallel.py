@@ -35,6 +35,7 @@ import time
 import warnings
 
 import dask
+import dask.array as da
 import dask.bag as db
 from sklearn.cluster import KMeans
 import numpy as np
@@ -54,7 +55,14 @@ def _stack_rows(rows):
 
 
 def _bag_to_matrices(X):
-    """Bag -> lista di Delayed, uno per partizione, ognuno una matrice (m, d)."""
+    """dask.array o dask.bag -> lista piatta di Delayed, uno per partizione,
+    ognuno una matrice (m, d). Un dask.array ha gia' chunk 2D; NB
+    ``Array.to_delayed()`` ritorna un ndarray annidato sulla griglia dei
+    chunk (a differenza di bag/dataframe che danno una lista piatta), quindi
+    va appiattito. Una bag di righe (backward-compat, smoke_test) viene
+    impilata con _stack_rows."""
+    if isinstance(X, da.Array):
+        return list(X.to_delayed().ravel().tolist())
     return [dask.delayed(_stack_rows, pure=True)(p) for p in X.to_delayed()]
 
 
@@ -309,11 +317,6 @@ def _update_state(M, state, new_centroids, start_idx):
     del round e' fuso nell'aggiornamento, cosicche' attraverso il confine
     client/cluster passa solo lo scalare e non la matrice di stato.
     """
-    # for debugging:
-    print(f"M: {M.shape}, {M.nbytes/1e6:.1f} MB | "
-          f"state: {state.shape}, {state.nbytes/1e6:.1f} MB | "
-          f"new_centroids: {new_centroids.shape}, {new_centroids.nbytes/1e6:.1f} MB")
-    
     if M.shape[0] == 0 or new_centroids.shape[0] == 0:
         return state, float(state[:, 0].sum())
     best_dist, best_idx = _pairwise_d2_argmin_chunked(M, new_centroids)
