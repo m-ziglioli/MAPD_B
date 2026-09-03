@@ -31,7 +31,7 @@ def calculate_inertia(X_bag, centroids):
 
 
 def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X=None, X_bag=None,
-                     track_convergence=False, track_centroids=False):
+                     track_convergence=True, track_centroids=False):
     """Esegue una singola run di k-means|| + Lloyd's fit."""
     if X_bag is None:
         if X is None:
@@ -65,7 +65,7 @@ def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X
 
     result = {
         "k": k, "l": l, "r": r, "r_effective": getattr(clf, "n_rounds_", None),
-        "partitions": num_partitions, "initial_cost": initial_cost, "final_cost": cost, "time": elapsed_time, "lloyd_time": lloyd_time, "seed": seed
+        "partitions": num_partitions, "initial_cost": initial_cost, "final_cost": cost, "time": elapsed_time, "lloyd_time": lloyd_time, "num effective lloyd iters": getattr(clf, "n_iter_", None), "seed": seed
     }
     if track_convergence:
         result["cost_history"], result["iter_times"] = clf.cost_history_, clf.iter_times_
@@ -90,7 +90,7 @@ def run_benchmark(client, X_bag=None, combinations=None, k_values=None, label="b
 
     # Prepara il file CSV una sola volta, prima di iniziare i test
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    csv_path = os.path.join(RESULTS_DIR, f"{label}{time.strftime('%Y%m%d%H%M%S')}.csv")
+    csv_path = os.path.join(RESULTS_DIR, f"{label}_{time.strftime('%Y%m%d%H%M%S')}.csv")
     csv_initialized = False
 
     results = []
@@ -108,7 +108,7 @@ def run_benchmark(client, X_bag=None, combinations=None, k_values=None, label="b
             print(f"Testing: k={k}, workers={n_workers}, partitions={current_bag.npartitions}, l={l} (l/k={l_over_k}), r={r}\n Iterating {averaging_iterations} times.")
 
             for i in range(averaging_iterations):
-                print(f"Iteration {i}")
+                print(f"Doing averaging iteration number {i}...")
                 result, current_bag = run_single_test(
                     client, k=k, l=l, r=r, num_partitions=num_partitions,
                     max_iter_fit=max_iter_fit, seed=seed + i, X_bag=current_bag

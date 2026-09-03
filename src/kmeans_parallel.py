@@ -103,7 +103,7 @@ def _pairwise_d2(M, C):
 
 # NOTE: kmeans parallel code is written such that each machine computes distances etc locally, using numpy etc (no dask subtasks) - this is ok because dataset small and dask approach would probably add overhead (aside from being more complex).
 # Main problem was that materialising full distance matrix on a single machine leads to crashing: for 5 workers (8 partitions per worker), k=100, 4e6 total points, we have 1e7 elements, each 8 Bytes, 8 cores simultaneously ---> 640 MB; then numpy operations can require 3x that ---> about 2 GB more.
-def _pairwise_d2_argmin_chunked(M, C, chunk_k=20):
+def _pairwise_d2_argmin_chunked(M, C, chunk_k=100):
     """
     Calcola, per ogni punto in M, la distanza al quadrato dal centroide
     più vicino in C - SENZA mai costruire la matrice completa (m, k).
@@ -310,9 +310,9 @@ def _update_state(M, state, new_centroids, start_idx):
     client/cluster passa solo lo scalare e non la matrice di stato.
     """
     # for debugging:
-    print(f"M: {M.shape}, {M.nbytes/1e6:.1f} MB | "
-          f"state: {state.shape}, {state.nbytes/1e6:.1f} MB | "
-          f"new_centroids: {new_centroids.shape}, {new_centroids.nbytes/1e6:.1f} MB")
+    #print(f"M: {M.shape}, {M.nbytes/1e6:.1f} MB | "
+    #      f"state: {state.shape}, {state.nbytes/1e6:.1f} MB | "
+    #      f"new_centroids: {new_centroids.shape}, {new_centroids.nbytes/1e6:.1f} MB")
     
     if M.shape[0] == 0 or new_centroids.shape[0] == 0:
         return state, float(state[:, 0].sum())
@@ -617,6 +617,8 @@ class kmeans_parallel():
                     row.reshape(1, -1) for row in new_centroids_arr
                 )
 
+
+# SVOLTATO ANCHE QUI? (analogo all'altro)
                 update_tasks = [
                     dask.delayed(_update_state, pure=False)(
                         p, s, new_centroids_arr, start_idx
@@ -626,9 +628,14 @@ class kmeans_parallel():
                 # lo stato aggiornato NON viene raccolto sul client: ne
                 # teniamo i riferimenti simbolici (input del round dopo) e
                 # calcoliamo solo gli scalari di costo fusi in _update_state.
-                state_delays = [u[0] for u in update_tasks]
-                cost = float(sum(dask.compute(*[u[1] for u in update_tasks])))
-
+                #state_delays = [u[0] for u in update_tasks]
+                #cost = float(sum(dask.compute(*[u[1] for u in update_tasks])))
+                
+                # Persist the full result (state + cost) 
+                persisted_results = list(dask.persist(*update_tasks))
+                state_delays = [r[0] for r in persisted_results]
+                cost = float(sum(dask.compute(*[r[1] for r in persisted_results])))
+######################################################################################
             if track_centroids:
                 self.n_centroids_history_.append(len(self.centroids))
 
@@ -700,17 +707,35 @@ class kmeans_parallel():
         empty_warned = False
 
         for iteration in range(max_iter):
+            print(f"Doing Lloyd's iteration {iteration}...")
             iter_start = time.time()
 
-            tasks = [
-                dask.delayed(_lloyd_pass, pure=False)(p, prev_labels[j], centroids_arr)
-                for j, p in enumerate(parts)
-            ]
+
+###########################################################################################
+            # SVOLTATO?
+            # Key trade‑off:
+            # Old: saved memory by not storing labels, but paid with ever‑growing graph.
+            # New: stores labels on workers (memory cost ~ n_points * 4 bytes) but keeps graph flat -> much faster.
+    
+            #tasks = [
+            #    dask.delayed(_lloyd_pass, pure=False)(p, prev_labels[j], centroids_arr)
+            #    for j, p in enumerate(parts)
+            #]
             # calcoliamo SOLO le riduzioni piccole t[:4]; l'elemento t[4]
             # (etichette della partizione) resta nel grafo come stato
             # distribuito per l'iterazione successiva.
+            #reductions = [t[:4] for t in tasks]
+            #results = dask.compute(*reductions)
+            tasks = [
+                dask.delayed(_lloyd_pass)(p, prev_labels[j], centroids_arr) for j, p in
+                enumerate(parts)
+            ]
+            tasks = list(dask.persist(*tasks))  # materialize now, cut the graph growth
             reductions = [t[:4] for t in tasks]
             results = dask.compute(*reductions)
+########################################################################################
+
+
 
             sums = np.zeros_like(centroids_arr)
             counts = np.zeros(k, dtype=np.int64)
@@ -723,7 +748,7 @@ class kmeans_parallel():
                 changed += p_changed
 
             # le nuove etichette diventano lo stato distribuito del giro dopo
-            prev_labels = [t[4] for t in tasks]
+            prev_labels = [t[4] for t in tasks] # now references the PERSISTED result, not a symbolic chain
 
             new_centroids = centroids_arr.copy()
             populated = counts > 0
@@ -741,7 +766,9 @@ class kmeans_parallel():
 
             if track_convergence:
                 self.cost_history_.append(iter_cost)
-                self.iter_times_.append(time.time() - iter_start)
+                this_iter_time=time.time() - iter_start
+                self.iter_times_.append(this_iter_time)
+                print(f"...iteration completed in {this_iter_time:.2f} s")
 
             # Strict convergence: stop as soon as no point changes cluster,
             # like sklearn does. The raw centroid-shift check below almost
@@ -751,10 +778,13 @@ class kmeans_parallel():
             if changed == 0:
                 break
 
-            if np.linalg.norm(new_centroids - centroids_arr) < tol:
+            if np.linalg.norm(new_centroids - centroids_arr) < tol* max(1, np.linalg.norm(centroids_arr)):
+                print(f"Stopped at LLoyd's iteration {iteration} due to relative tolerance threshold {tol}")
                 break
 
             centroids_arr = new_centroids
+
+            
 
     # --------------------------------------------------------------------
 
