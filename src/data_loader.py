@@ -1,140 +1,259 @@
+"""
+data_loader.py
+==============
+End-to-end data pipeline for the KDD Cup 1999 dataset, bounded-memory even
+on the full dataset:
+
+1. Master downloads the .gz (skipped if cached, unless force_download).
+2. Master converts the .gz into ``n_partitions`` Parquet shard files inside
+   the directory ``parquet_path`` (streaming: the whole CSV is never held
+   in RAM). Shards are cached: re-running with the same parameters reuses
+   them.
+3. Each shard is scattered to ONE worker (round-robin via
+   ``client.scatter``): no worker holds the entire dataset, and the master
+   holds at most one shard in RAM at a time (no full-file ``f.read()``
+   broadcast).
+4. Preprocessing runs on the workers in two passes:
+   - pass 1: per-shard reduced statistics -> global mean/std/min/max and
+     constant columns;
+   - pass 2: per-shard standardization -> dense (m, d) matrix.
+5. Returns a ``dask.array`` (n, d) whose chunks are the per-shard matrices
+   (one chunk per partition, known shapes), plus (mean, std) as pandas
+   Series to go back to the original coordinates.
+
+Synthetic generators and in-memory helpers (used for the paper
+reproduction, see docs/ANALYSIS_PLAN.md) live at the bottom: no network or
+disk access.
+"""
+
 import os
+import io
 import gzip
 import urllib.request
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 import dask
-import dask.dataframe as dd
-import dask.bag as db
+import dask.array as da
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+# Non-numeric columns (dropped) and the label column (not a feature).
+CATEGORICAL_COLS = ["protocol_type", "service", "flag"]
+LABEL_COL = "label"
 
-# helper to count number lines in a gz file, used for partitioning later
+
 def _count_lines_gz(filepath):
+    """Count the number of lines in a .gz file (used for partitioning)."""
     count = 0
-    with gzip.open(filepath, 'rt') as f:
+    # newline="\n" disables universal-newline translation: in default text
+    # mode a file with CRLF line endings (Windows) is counted twice (once
+    # per \r and once per \n). An explicit newline counts real records.
+    with gzip.open(filepath, "rt", newline="\n") as f:
         for _ in f:
             count += 1
     return count
 
-def load_dataset(dataset_url, raw_gz_path, parquet_path, parquet_path_workers, col_names, n_partitions=4, client=None, force_download=False): # Local path on each worker's disk 
-                                  # has to be the same as master's, otherwise metadata issues 
-    """
-    1. Master downloads the .gz file (skipped if raw_gz_path already exists,
-       unless force_download=True), converts it to a Parquet file,
-       separated into chunks of the specified size (total size / number of partitions).
 
-    Then the Parquet dataset is converted to a distributed Dask bag of NumPy arrays. Steps:
-      2. Read Parquet with Dask – workers read row groups in parallel.
-      3. Preprocess: drop categorical columns, scale numeric features.
-      4. Return a Dask bag where each element is a 1-D array of features.
-    """
-    #os.makedirs("./data", exist_ok=True)
+def _write_shards(raw_gz_path, shard_files, col_names):
+    """Convert the .gz into one Parquet shard per chunk, streaming: the
+    master never loads the entire dataset in memory."""
+    n_total_rows = _count_lines_gz(raw_gz_path)
+    chunk_size = int(np.ceil(n_total_rows / len(shard_files)))
+    print("Converting .gz -> Parquet shards...")
+    schema = pa.schema({col: pa.string() for col in col_names})
+    with gzip.open(raw_gz_path, "rt") as f_in:
+        reader = pd.read_csv(
+            f_in, header=None, names=col_names, dtype=str, chunksize=chunk_size
+        )
+        for i, chunk_df in enumerate(reader):
+            table = pa.Table.from_pandas(chunk_df, schema=schema)
+            pq.write_table(table, shard_files[i], compression="snappy")
+    print(f"Parquet shards created ({len(shard_files)} files, snappy).")
 
-    # --- Download GZ file---
+
+def _clean_shard_df(df, constant_cols=()):
+    """Per-shard preprocessing, identical to the old dask.dataframe
+    pipeline: drop categorical/label columns, coerce to numeric, dropna,
+    drop constant columns."""
+    df = df.drop(columns=CATEGORICAL_COLS + [LABEL_COL], errors="ignore")
+    df = df.apply(pd.to_numeric, errors="coerce")
+    df = df.dropna()
+    if constant_cols:
+        df = df.drop(columns=constant_cols)
+    return df
+
+
+def _shard_stats(data):
+    """Pass 1: reduced statistics of one shard (count, sum, sumsq, min, max)
+    plus the column list (deterministic order = col_names order)."""
+    df = pd.read_parquet(io.BytesIO(data))
+    df = _clean_shard_df(df)
+    cols = list(df.columns)
+    n = len(df)
+    d = len(cols)
+    if n == 0:
+        # Empty shard after dropna: must not influence the global min/max.
+        return n, np.zeros(d), np.zeros(d), np.full(d, np.inf), np.full(d, -np.inf), cols
+    return (
+        n,
+        df.sum().to_numpy(dtype=np.float64),
+        (df ** 2).sum().to_numpy(dtype=np.float64),
+        df.min().to_numpy(dtype=np.float64),
+        df.max().to_numpy(dtype=np.float64),
+        cols,
+    )
+
+
+def _shard_matrix(data, constant_cols, final_cols, mean, std):
+    """Pass 2: re-read one shard, re-apply preprocessing and return the
+    standardized (m, d) matrix (same column order as ``final_cols``)."""
+    df = pd.read_parquet(io.BytesIO(data))
+    df = _clean_shard_df(df, constant_cols)
+    df = df[final_cols]
+    return (df.to_numpy(dtype=np.float64) - mean) / std
+
+
+def _delayed_matrices_to_array(matrix_tasks, row_counts, n_features):
+    """List of Delayed (each a 2-D (m_i, d) matrix) -> dask.array (n, d)
+    with one chunk per Delayed.
+
+    ``da.from_delayed`` does not accept lists, so each shard is wrapped
+    individually and then concatenated along axis 0. Chunk shapes MUST be
+    known: with ``(np.nan, d)`` dask treats unknown chunks as size 1 in
+    concatenate/slicing and silently produces wrong results. The per-shard
+    counts come from pass 1 (post-dropna, same preprocessing as pass 2, so
+    they are exact)."""
+    parts = [
+        da.from_delayed(t, shape=(int(m), n_features), dtype=np.float64)
+        for t, m in zip(matrix_tasks, row_counts)
+    ]
+    if len(parts) == 1:
+        return parts[0]
+    return da.concatenate(parts, axis=0)
+
+
+def load_dataset(dataset_url, raw_gz_path, parquet_path, col_names,
+                 n_partitions=4, client=None, force_download=False):
+    """
+    End-to-end data pipeline, bounded-memory even on the full dataset.
+
+    Parameters
+    ----------
+    dataset_url : str
+        URL of the compressed dataset (used only if raw_gz_path is missing
+        or force_download=True).
+    raw_gz_path : str
+        Local path of the cached .gz file on the master.
+    parquet_path : str
+        Directory (on the master) where the Parquet shards are written and
+        cached. Shards are scattered directly to the workers from here;
+        nothing is copied to the workers' disks.
+    col_names : list of str
+        Column names of the CSV records (KDD Cup has no header).
+    n_partitions : int
+        Number of Parquet shards == number of chunks of the returned array
+        == number of partitions seen by the k-means engine. Scattered
+        round-robin over the workers: with the project convention
+        n_partitions = 8 * workers each worker holds exactly 8 shards.
+    client : dask.distributed.Client
+        Required: shards are scattered through it.
+    force_download : bool
+        Re-download the .gz and re-write the shards even if cached.
+
+    Returns
+    -------
+    X : dask.array (n, d), float64
+        Standardized features; one chunk per shard (known shapes).
+    (mean, std) : pandas Series
+        Global mean/std used for standardization, indexed by feature name.
+    """
+    if client is None:
+        raise ValueError("load_dataset requires a Dask client (pass client=client)")
+    os.makedirs(parquet_path, exist_ok=True)
+
+    # --- 1. Download the .gz (cached) ---
     if force_download or not os.path.exists(raw_gz_path):
         print("Downloading compressed dataset...")
         urllib.request.urlretrieve(dataset_url, raw_gz_path)
     else:
         print(f"Using cached dataset: {raw_gz_path}")
 
-    # --- Convert to Parquet---
-    n_total_rows = _count_lines_gz(raw_gz_path)
-    chunk_size = int(np.ceil(n_total_rows / n_partitions))
-    print("Converting .gz -> Parquet chunk sizes...")
-    schema = pa.schema({col: pa.string() for col in col_names})
-    with gzip.open(raw_gz_path, "rt") as f_in, \
-         pq.ParquetWriter(parquet_path, schema, compression='snappy') as writer:
-        # pandas reads and discards chunks – never loads the whole dataset
-        # (assumption: if a single worker can handle a single uncompressed partition, so can the master)
-        for chunk_df in pd.read_csv(
-            f_in,
-            header=None,
-            names=col_names,
-            dtype=str,
-            chunksize=chunk_size # equal to number of rows read at a time
-        ):
-            table = pa.Table.from_pandas(chunk_df, schema=schema)
-            writer.write_table(table)
-    print("Parquet file created (compressed with snappy).")
+    # --- 2. GZ -> Parquet shards on the master (streaming, cached) ---
+    shard_files = [
+        os.path.join(parquet_path, f"shard_{i:05d}.parquet")
+        for i in range(n_partitions)
+    ]
+    if force_download or not all(os.path.exists(f) for f in shard_files):
+        _write_shards(raw_gz_path, shard_files, col_names)
+    else:
+        print(f"Using cached parquet shards: {parquet_path}")
 
-    #############################################################
-    # Read the compressed Parquet file (master only)
-    with open(parquet_path, 'rb') as f:
-        parquet_bytes = f.read()
-    
-    # Copy it to every worker's disk (each worker gets its own full .parquet file on its disk, same path for all)
-    def save_parquet_to_workers(data):
-        with open(parquet_path_workers, 'wb') as f:
-            f.write(data)
-    client.run(save_parquet_to_workers, parquet_bytes) # assuming already existing client
-        
-    ddf = dd.read_parquet(parquet_path_workers, split_row_groups=True) # dask distributed dataframe, so from here on will be automatically parallelized (optimized for column operations)
-    print("Number of partitions before preprocessing:", ddf.npartitions)
+    # --- 3. Scatter one shard per worker (round-robin) ---
+    # The master holds at most one shard in RAM at a time; scattered futures
+    # are sticky, so tasks consuming them run where the shard lives. Note:
+    # if n_partitions < n_workers some workers receive no shard and stay idle.
+    futures = []
+    for f in shard_files:
+        with open(f, "rb") as fh:
+            futures.append(client.scatter(fh.read()))
+    # Delayed references to the shards already materialized on the workers.
+    delayed_shards = [dask.delayed(fu) for fu in futures]
 
-    # --- 3. Preprocessing ---
-    # Drop the known categorical columns immediately (they are not numeric)
-    categorical_cols = ["protocol_type", "service", "flag"]
-    ddf = ddf.drop(columns=categorical_cols) 
-    # Now convert the remaining columns to numeric
-    ddf = ddf.map_partitions(
-    lambda df: df.apply(pd.to_numeric, errors="coerce"),
-    meta={c: 'f8' for c in ddf.columns}
-    )
-    # d) Keep only feature columns (remove 'label')
-    # because we are using clustering cost only as a metric, this is not required
-    ddf = ddf.drop(columns=['label'])
-    # Drop rows that still contain NaN (if any numerical field was invalid)
-    ddf = ddf.dropna()
-    # check for constant columns by comparing their min and max (uninformative -> drop them) 
-    col_min, col_max = dask.compute(ddf.min(), ddf.max())
-    constant_cols = col_min[col_min == col_max].index.tolist()
-    print("Constant columns:", constant_cols) # should be only the one named 'num_outbound_cmds'
-    ddf = ddf.drop(columns=constant_cols)
-    # e) Standardize using global mean & std (computed lazily, then applied)
-    # result is a small (around 40 elements) Series, so not an issue when materialized anywhere
-    print("Computing global mean and std (first pass over data)...")
-    mean, std = dask.compute(ddf.mean(), ddf.std())
-    # Apply scaling partition‑wise (workers do the work)
-    feature_cols = list(ddf.columns)   # these are the names of the remaining (numeric) columns
-    ddf = ddf.map_partitions(lambda df: (df - mean) / std,
-                             meta={c: 'float64' for c in feature_cols})
-                             # keep column names as metadata (dtype come stringa,
-                             # non tipo python: meta deve essere spec pandas valido)
+    # --- 4a. Pass 1: global statistics ---
+    stats = dask.compute(*[dask.delayed(_shard_stats)(s) for s in delayed_shards])
+    counts = [s[0] for s in stats]
+    sums = np.vstack([s[1] for s in stats])
+    sq_sums = np.vstack([s[2] for s in stats])
+    mins = np.vstack([s[3] for s in stats])
+    maxs = np.vstack([s[4] for s in stats])
+    cols = stats[0][5]
 
+    total_count = float(sum(counts))
+    global_sum = sums.sum(axis=0)
+    global_sq = sq_sums.sum(axis=0)
+    global_min = mins.min(axis=0)
+    global_max = maxs.max(axis=0)
 
-    
-    # --- 4. Convert to Dask bag of NumPy arrays ---
-    # because this is what is used in notebooks
-    #X_bag = ddf.to_bag(index=False).map(
-    #lambda row: np.array(row, dtype=np.float64)
-    #)
-    def part_to_array(df):
-        return df.to_numpy(dtype=np.float64)
-    arrays = ddf.map_partitions(part_to_array, meta=np.array([])) # map_partitions is designed for DataFrame-like results; we're repurposing it to hold arrays
-    X_bag = db.from_delayed(arrays.to_delayed())
+    mean_all = global_sum / total_count
+    # Sample variance (ddof=1), matching the old dask.dataframe pipeline.
+    var_all = (global_sq - total_count * mean_all ** 2) / (total_count - 1)
+    std_all = np.sqrt(np.maximum(var_all, 0.0))
 
+    # Constant columns carry no information (expected: 'num_outbound_cmds').
+    constant_cols = [c for c, lo, hi in zip(cols, global_min, global_max) if lo == hi]
+    final_cols = [c for c in cols if c not in constant_cols]
+    final_idx = [cols.index(c) for c in final_cols]
+    final_mean = mean_all[final_idx]
+    final_std = std_all[final_idx]
+    print("Constant columns:", constant_cols)
 
-    
-    # final number of partitions might be smaller because dropna() might fuse small partitions
-    print(f"Distributed bag created with {X_bag.npartitions} partitions.")
-    print("Number of samples:", ddf.shape[0].compute())
-    # return mean and std as well if want to go back to original coordinates later
-    return X_bag, (mean,std)
+    # --- 4b. Pass 2: standardized per-shard matrices -> dask.array ---
+    matrix_tasks = [
+        dask.delayed(_shard_matrix)(s, constant_cols, final_cols, final_mean, final_std)
+        for s in delayed_shards
+    ]
+    X = _delayed_matrices_to_array(matrix_tasks, counts, len(final_cols))
+
+    mean_series = pd.Series(final_mean, index=final_cols)
+    std_series = pd.Series(final_std, index=final_cols)
+
+    print(f"Distributed dask.array created with {X.npartitions} partitions.")
+    print("Number of samples:", int(total_count))
+    return X, (mean_series, std_series)
 
 
 # ---------------------------------------------------------------------------
-# Generatori sintetici e helper (per la riproduzione dell'articolo, vedi
-# docs/ANALYSIS_PLAN.md): nessun accesso a rete/disco, tutto in memoria.
+# Synthetic generators and in-memory helpers (used for the paper
+# reproduction, see docs/ANALYSIS_PLAN.md): no network/disk access.
 # ---------------------------------------------------------------------------
 
 def make_gauss_mixture(n, k, d=15, R=1.0, seed=None):
-    """GaussMixture della Fig 5.2 di Bahmani et al. (2012): k centri ~
-    N(0, R*I_d), ogni punto assegnato a un centro uniformemente e poi
-    estratto come N(centro, I_d), pesi uguali.
+    """GaussMixture of Fig 5.2 of Bahmani et al. (2012): k centers ~
+    N(0, R*I_d), each point assigned to a center uniformly at random and
+    drawn as N(center, I_d), equal weights.
 
-    Ritorna (X (n,d) float64, y (n,) label, centers (k,d)).
+    Returns (X (n,d) float64, y (n,) labels, centers (k,d)).
     """
     rng = np.random.default_rng(seed)
     centers = rng.normal(0.0, float(R), size=(k, d))
@@ -143,10 +262,11 @@ def make_gauss_mixture(n, k, d=15, R=1.0, seed=None):
     return X.astype(np.float64), y.astype(np.int64), centers
 
 
-def array_to_bag(X, n_partitions=4):
-    """Array numpy (n,d) -> Dask Bag di righe 1-D float64: lo STESSO formato
-    prodotto da load_dataset (un elemento per riga), utile per i test locali
-    e per il GaussMixture senza passare da Parquet."""
+def array_to_dask(X, n_partitions=4):
+    """Numpy array (n,d) -> dask.array (n,d) in ``n_partitions`` chunks: the
+    SAME format produced by load_dataset (one chunk = one 2-D partition
+    matrix), useful for local tests and for the GaussMixture without going
+    through Parquet."""
     n_partitions = max(1, min(int(n_partitions), X.shape[0]))
-    rows = [row for chunk in np.array_split(X, n_partitions) for row in chunk]
-    return db.from_sequence(rows, npartitions=n_partitions)
+    chunk = int(np.ceil(X.shape[0] / n_partitions))
+    return da.from_array(X.astype(np.float64), chunks=(chunk,))
