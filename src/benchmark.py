@@ -31,7 +31,7 @@ def calculate_inertia(X_bag, centroids):
 
 
 def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X=None, X_bag=None,
-                     track_convergence=True, track_centroids=False):
+                     track_convergence=True, track_centroids=True, policy="auto"):
     """Esegue una singola run di k-means|| + Lloyd's fit."""
     if X_bag is None:
         if X is None:
@@ -41,7 +41,7 @@ def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X
     clf = kmeans_parallel(k=k, l=l, r=r)
     start_time = time.time()
     try:
-        clf.compute_starting_centroids(X_bag, seed=seed, track_centroids=track_centroids)
+        clf.compute_starting_centroids(X_bag, seed=seed, track_centroids=track_centroids,policy=policy)
     except ValueError as e:
         if "n_clusters" not in str(e):
             raise
@@ -76,7 +76,7 @@ def run_single_test(client, k, l, r, num_partitions, max_iter_fit=10, seed=42, X
 
 
 def run_benchmark(client, X_bag=None, combinations=None, k_values=None, label="benchmark",
-                   max_iter_fit=10, seed=42, averaging_iterations=10, X_arr=None):
+                   max_iter_fit=10, seed=42, averaging_iterations=10, X_arr=None,policy="auto"):
     """Esegue una griglia di test mantenendo i dati distribuiti su Dask.
     Varia n_workers, num_partitions, l_over_k, r.
     Salva ogni singolo risultato su CSV subito dopo il calcolo (append),
@@ -111,7 +111,7 @@ def run_benchmark(client, X_bag=None, combinations=None, k_values=None, label="b
                 print(f"Doing averaging iteration number {i}...")
                 result, current_bag = run_single_test(
                     client, k=k, l=l, r=r, num_partitions=num_partitions,
-                    max_iter_fit=max_iter_fit, seed=seed + i, X_bag=current_bag
+                    max_iter_fit=max_iter_fit, seed=seed + i, X_bag=current_bag, policy=policy
                 )
                 result.update({"workers": n_workers, "l_over_k": l_over_k})
                 results.append(result)

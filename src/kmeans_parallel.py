@@ -238,7 +238,7 @@ def _init_state(M, c0):
     colonna 1 = indice del centroide piu' vicino (0)."""
     if M.shape[0] == 0:
         return np.empty((0, 2))
-    d2 = _pairwise_d2(M, c0.reshape(1, -1))[:, 0]
+    d2 = _pairwise_d2(M, c0.reshape(1, -1))[:, 0] # old version works fine
     return np.column_stack([d2, np.zeros(len(M))])
 
 
@@ -379,14 +379,14 @@ def _labels_partition(M, C):
     """Etichette per partizione, come lista di int scalari (semantica Bag)."""
     if M.shape[0] == 0:
         return []
-    return _pairwise_d2(M, C).argmin(axis=1).tolist()
+    return _pairwise_d2_argmin_chunked(M, C).argmin(axis=1).tolist()
 
 
 def _inertia_partial(M, C):
     """Somma parziale delle d^2 al centroide piu' vicino, per partizione."""
     if M.shape[0] == 0:
         return 0.0
-    d2 = _pairwise_d2(M, C)
+    d2 = _pairwise_d2_argmin_chunked(M, C)
     return float(d2[np.arange(M.shape[0]), d2.argmin(axis=1)].sum())
 
 
@@ -707,7 +707,7 @@ class kmeans_parallel():
         empty_warned = False
 
         for iteration in range(max_iter):
-            print(f"Doing Lloyd's iteration {iteration}...")
+            #print(f"Doing Lloyd's iteration {iteration}...")
             iter_start = time.time()
 
 
@@ -768,7 +768,7 @@ class kmeans_parallel():
                 self.cost_history_.append(iter_cost)
                 this_iter_time=time.time() - iter_start
                 self.iter_times_.append(this_iter_time)
-                print(f"...iteration completed in {this_iter_time:.2f} s")
+                #print(f"...iteration completed in {this_iter_time:.2f} s")
 
             # Strict convergence: stop as soon as no point changes cluster,
             # like sklearn does. The raw centroid-shift check below almost
