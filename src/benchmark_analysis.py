@@ -1,22 +1,22 @@
 """
 benchmark_analysis.py
 
-Modulo generico per analizzare risultati di benchmark:
-- raggruppa un CSV per colonne arbitrarie
-- calcola mean/std di metriche arbitrarie
-- genera grafici errorbar per ogni combinazione delle colonne "facet"
-  rispetto a una variabile sull'asse x
+Generic module to analyze benchmark results:
+- group a CSV by arbitrary columns
+- compute mean/std of arbitrary metrics
+- generate errorbar plots for every combination of the "facet" columns
+  against a variable on the x axis
 
-Uso rapido (in fondo al file trovi un esempio eseguibile):
+Quick usage (an executable example is at the bottom of the file):
 
     from src.benchmark_analysis import BenchmarkAnalyzer
 
     analyzer = BenchmarkAnalyzer(
         data_path="results/kddcup99_benchmark_<timestamp>.csv",
         output_dir="figures",
-        facet_cols=["k"],              # una figura per ogni valore (combinazione) di queste colonne
-        x_col="l_over_k",               # variabile sull'asse x
-        metrics=["cost", "time"],       # colonne di cui calcolare mean/std e plottare
+        facet_cols=["k"],              # one figure per value (combination) of these columns
+        x_col="l_over_k",               # variable on the x axis
+        metrics=["cost", "time"],       # columns to compute mean/std of and plot
     )
     grouped = analyzer.compute_grouped_stats(groupby_cols=["k", "l_over_k"])
     analyzer.print_summary(grouped)
@@ -38,11 +38,11 @@ import matplotlib.pyplot as plt
 class BenchmarkAnalyzer:
     data_path: str
     output_dir: str
-    facet_cols: Sequence[str]          # colonne che definiscono una figura separata (es. ["k"])
-    x_col: str                         # colonna sull'asse x (es. "l_over_k")
+    facet_cols: Sequence[str]          # columns defining a separate figure (e.g. ["k"])
+    x_col: str                         # column on the x axis (e.g. "l_over_k")
     metrics: Sequence[str] = field(default_factory=lambda: ["cost", "time"])
-    metric_labels: Optional[dict] = None   # es. {"cost": "Cost", "time": "Time (s)"}
-    colors: Optional[dict] = None          # es. {"cost": "tab:blue", "time": "tab:orange"}
+    metric_labels: Optional[dict] = None   # e.g. {"cost": "Cost", "time": "Time (s)"}
+    colors: Optional[dict] = None          # e.g. {"cost": "tab:blue", "time": "tab:orange"}
     dpi: int = 150
     df: pd.DataFrame = field(init=False, repr=False)
 
@@ -58,18 +58,18 @@ class BenchmarkAnalyzer:
             self.colors = {m: palette[i % len(palette)] for i, m in enumerate(self.metrics)}
 
     # ------------------------------------------------------------------ #
-    # Statistiche
+    # Statistics
     # ------------------------------------------------------------------ #
     def compute_grouped_stats(self, groupby_cols: Sequence[str]) -> pd.DataFrame:
         """
-        Raggruppa self.df per groupby_cols e calcola mean/std/n_runs
-        per ciascuna metrica in self.metrics.
+        Group self.df by groupby_cols and compute mean/std/n_runs
+        for each metric in self.metrics.
         """
         agg_dict = {}
         for m in self.metrics:
             agg_dict[f"{m}_mean"] = (m, "mean")
             agg_dict[f"{m}_std"] = (m, "std")
-        # n_runs preso dalla prima metrica disponibile
+        # n_runs taken from the first available metric
         agg_dict["n_runs"] = (self.metrics[0], "size")
 
         grouped = (
@@ -90,7 +90,7 @@ class BenchmarkAnalyzer:
     # Plotting
     # ------------------------------------------------------------------ #
     def _facet_combinations(self, grouped: pd.DataFrame) -> Iterable[tuple]:
-        """Genera tutte le combinazioni presenti nei dati per facet_cols."""
+        """Generate all combinations present in the data for facet_cols."""
         if not self.facet_cols:
             yield tuple()
             return
@@ -100,9 +100,9 @@ class BenchmarkAnalyzer:
 
     def plot_all(self, grouped: Optional[pd.DataFrame] = None) -> List[str]:
         """
-        Genera una figura per ogni combinazione di facet_cols, con un
-        subplot per ogni metrica in self.metrics (errorbar mean ± std).
-        Ritorna la lista dei path salvati.
+        Generate one figure per combination of facet_cols, with one
+        subplot per metric in self.metrics (errorbar mean ± std).
+        Returns the list of saved paths.
         """
         if grouped is None:
             grouped = self._last_grouped

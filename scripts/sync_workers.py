@@ -1,24 +1,25 @@
 """
 sync_workers.py
 ===============
-Deploy di ``src/`` + ``requirements.txt`` + file .pth su TUTTI i worker del
-cluster (vedi docs/CHANGES.md 2026-08-24).
+Deploy ``src/`` + ``requirements.txt`` + a .pth file to ALL the cluster
+workers (see docs/CHANGES.md 2026-08-24).
 
-Perche' serve
--------------
-I worker sono VM separate dal head e NON hanno la repo: senza questo step i
-task serializzati by-reference non riescono a risolvere ``import src`` sul
-worker (e la catena di import di src.kmeans_parallel richiede sklearn, che
-sui worker puo' mancare -> crash del processo -> KilledWorker). Il file .pth
-inserisce la repo nel sys.path del pyvenv remoto qualunque sia la cwd.
+Why it is needed
+----------------
+The workers are VMs separate from the head and do NOT have the repo:
+without this step, tasks serialized by-reference cannot resolve
+``import src`` on the worker (and the import chain of src.kmeans_parallel
+requires sklearn, which may be missing on the workers -> process crash ->
+KilledWorker). The .pth file puts the repo on the remote pyvenv's sys.path
+regardless of the cwd.
 
-DA RIESEGUIRE dopo ogni ``git pull`` di codice nuovo (il deploy copia i
-sorgenti correnti del head).
+RE-RUN after every ``git pull`` of new code (the deploy copies the head's
+current sources).
 
-Uso (sul HEAD VM, dalla checkout, shell del progetto):
-    python scripts/sync_workers.py              # deploy + verifica import
+Usage (on the HEAD VM, from the checkout, project shell):
+    python scripts/sync_workers.py              # deploy + import verification
     python scripts/sync_workers.py --install    # + pip install requirements
-    python scripts/sync_workers.py --check      # solo verifica import
+    python scripts/sync_workers.py --check      # import verification only
 """
 
 import argparse
@@ -28,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.launch_cluster import WORKER_IPS  # lista IP centralizzata (AGENTS.md)
+from src.launch_cluster import WORKER_IPS  # centralized IP list (AGENTS.md)
 
 REPO_DIR = Path("/home/ubuntu/Project/libero_development")
 REMOTE_PY = "/home/ubuntu/pyvenv/bin/python3"
@@ -43,7 +44,7 @@ IMPORT_CHECK = (
 
 
 def run(cmd):
-    """Esegue un comando remoto; ritorna l'output o stampa l'errore."""
+    """Run a remote command; return the output or print the error."""
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         print(f"  [FAIL] {' '.join(cmd[:4])}...")
@@ -53,8 +54,8 @@ def run(cmd):
 
 
 def remote_site_dir(host):
-    """Directory site-packages del pyvenv remoto (robusto rispetto alla
-    versione di python, invece di hardcodare .../python3.10/)."""
+    """site-packages directory of the remote pyvenv (robust to the python
+    version, instead of hardcoding .../python3.10/)."""
     out = run(SSH + [host, f"{REMOTE_PY} -c 'import site; print(site.getsitepackages()[0])'"])
     return out.strip().splitlines()[-1] if out else None
 
@@ -62,9 +63,9 @@ def remote_site_dir(host):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--install", action="store_true",
-                    help="pip install -r requirements.txt su ogni worker")
+                    help="pip install -r requirements.txt on every worker")
     ap.add_argument("--check", action="store_true",
-                    help="solo verifica import (nessun deploy)")
+                    help="import verification only (no deploy)")
     args = ap.parse_args()
 
     n_ok = 0
@@ -80,7 +81,7 @@ def main():
             if site:
                 run(SSH + [host, f"echo '{REPO_DIR}' > {site}/mapd_b_project.pth"])
             else:
-                print("  [WARN] site-packages non trovato: .pth non creato")
+                print("  [WARN] site-packages not found: .pth not created")
 
         if args.install:
             r = subprocess.run(
@@ -96,7 +97,7 @@ def main():
             print("  ", out.strip())
             n_ok += 1
 
-    print(f"\n{n_ok}/{len(WORKER_IPS)} worker con import OK")
+    print(f"\n{n_ok}/{len(WORKER_IPS)} workers with import OK")
     return 0 if n_ok == len(WORKER_IPS) else 1
 
 

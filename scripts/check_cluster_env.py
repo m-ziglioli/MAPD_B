@@ -1,18 +1,18 @@
 """
 check_cluster_env.py
 ====================
-Verifica l'ambiente dei WORKER del cluster in un colpo solo: le versioni dei
-pacchetti freeze (requirements.txt) devono corrispondere su OGNI nodo.
-Nato dall'incidente del 2026-08-24 (worker riprovisionati senza sklearn ->
-import by-reference in task -> crash processo -> KilledWorker, vedi
-docs/CHANGES.md): con questo check il problema emerge in secondi.
+Verify the cluster WORKERS' environment in one shot: the versions of the
+freeze packages (requirements.txt) must match on EVERY node.
+Born from the 2026-08-24 incident (workers re-provisioned without sklearn
+-> by-reference import in a task -> process crash -> KilledWorker, see
+docs/CHANGES.md): with this check the problem surfaces in seconds.
 
-Uso (con un Client gia' attivo, es. dentro un notebook sul head VM):
+Usage (with a Client already active, e.g. inside a notebook on the head VM):
     from scripts.check_cluster_env import check_workers
     check_workers(client)
 
-Oppure standalone:
-    python scripts/check_cluster_env.py            # usa Client() default
+Or standalone:
+    python scripts/check_cluster_env.py            # uses the default Client()
 """
 
 import sys
@@ -25,7 +25,7 @@ PACKAGES = ["dask", "distributed", "numpy", "pandas", "pyarrow",
 
 
 def _probe():
-    """Versioni installate NEL processo corrente (client o worker)."""
+    """Versions installed IN the current process (client or worker)."""
     import importlib.metadata as im
 
     out = {}
@@ -33,29 +33,29 @@ def _probe():
         try:
             out[pkg] = im.version(pkg)
         except im.PackageNotFoundError:
-            out[pkg] = "MANCANTE"
+            out[pkg] = "MISSING"
     return out
 
 
 def check_workers(client):
-    """Sonda ogni worker via client.run (nessuna dipendenza da get_worker,
-    che non e' disponibile in quel contesto). Ritorna (local, remote) dove
-    remote e' {worker_address: {pkg: versione}}. Stampa una tabella e un
-    verdetto per differenze rispetto all'ambiente del client (il head,
-    riferimento del freeze)."""
+    """Probe every worker via client.run (no dependency on get_worker,
+    which is not available in that context). Returns (local, remote) where
+    remote is {worker_address: {pkg: version}}. Prints a table and a
+    verdict on differences against the client's environment (the head,
+    the freeze reference)."""
     local = _probe()
     remote = client.run(_probe)
 
-    print(f"pacchetti: {', '.join(PACKAGES)}\n")
+    print(f"packages: {', '.join(PACKAGES)}\n")
     print("client (head):")
     print("  " + "  ".join(f"{p}={local[p]}" for p in PACKAGES))
-    print("worker:")
+    print("workers:")
     mismatches = 0
     for addr, env in remote.items():
         diffs = [p for p in PACKAGES if env.get(p) != local[p]]
         if diffs:
             mismatches += 1
-            flag = " <-- DIFFERENZE: " + ", ".join(
+            flag = " <-- DIFFERENCES: " + ", ".join(
                 f"{p}({env.get(p, '?')} vs {local[p]})" for p in diffs)
         else:
             flag = "OK"
@@ -64,10 +64,10 @@ def check_workers(client):
         print(f"    {flag}")
 
     if mismatches:
-        print(f"\nVERDETTO: {mismatches} worker DISALLINEATI -> "
+        print(f"\nVERDICT: {mismatches} workers MISALIGNED -> "
               "python scripts/sync_workers.py --install")
     else:
-        print("\nVERDETTO: ambiente allineato su tutti i worker")
+        print("\nVERDICT: environment aligned on all workers")
     return local, remote
 
 
@@ -78,7 +78,7 @@ def main():
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--address", default=None,
-                    help="indirizzo dello scheduler (default: Client() default)")
+                    help="scheduler address (default: default Client())")
     args = ap.parse_args()
 
     client = Client(args.address) if args.address else Client()
