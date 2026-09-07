@@ -376,18 +376,17 @@ def resolve_rounds(l, k, r=None, alpha=1.0, psi=None, policy="auto"):
 
 
 def _labels_partition(M, C):
-    """Etichette per partizione, come lista di int scalari (semantica Bag)."""
     if M.shape[0] == 0:
         return []
-    return _pairwise_d2_argmin_chunked(M, C).argmin(axis=1).tolist()
+    _, best_idx = _pairwise_d2_argmin_chunked(M, C)
+    return best_idx.tolist()
 
 
 def _inertia_partial(M, C):
-    """Somma parziale delle d^2 al centroide piu' vicino, per partizione."""
     if M.shape[0] == 0:
         return 0.0
-    d2 = _pairwise_d2_argmin_chunked(M, C)
-    return float(d2[np.arange(M.shape[0]), d2.argmin(axis=1)].sum())
+    best_dist, _ = _pairwise_d2_argmin_chunked(M, C)
+    return float(best_dist.sum())
 
 
 def inertia_of_bag(X_bag, centroids):
