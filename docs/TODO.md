@@ -21,7 +21,8 @@
   GaussMixture, src/paper_experiments.py, notebook flag-gated)
 - [ ] ESECUZIONE articolo su cluster (ANALYSIS_PLAN sessioni A/B): Fig 5.1,
   Tables 3/4 (+sanity check), Fig 5.2 locale; poi write-up obtained-vs-paper
-- [ ] FASE D (out-of-core): shard Parquet per worker invece di repliche,
-  repartitioning nel grafo senza materializzazione client, validazione
-  costi identici su KDD 10%
+- [x] FASE D (shard Parquet per worker, CHANGES 2026-08-30): niente repliche
+  del dataset, ogni shard sta su un worker; resta aperto il repartitioning
+  nel grafo senza materializzazione client (run_benchmark ancora raccoglie
+  X_arr una volta per ri-scatterare) + validazione costi identici su KDD 10%
 - [ ] POSTPONATO→IN CORSO: voci sopra (il piano resta in docs/ANALYSIS_PLAN.md)

@@ -1,5 +1,139 @@
 # Changelog
 
+## 2026-08-30 — Refactor pipeline dati: shard Parquet per worker + dask.array (basta bag di righe)
+
+Sostituito il contratto "bag di righe" con **shard Parquet per worker +
+`dask.array` di matrici 2D**, eliminando gli ultimi colli di bottiglia di
+memoria sul master e sul 100% del KDD. (Commit `8357014`, ripristinato
+dopo un revert accidentale nel 2026-09-09.)
+
+### `src/data_loader.py` (riscritto)
+
+1. Download `.gz` in cache (invariato).
+2. **Conversione `.gz` → N shard Parquet in streaming sul master**
+   (`pd.read_csv(chunksize=...)` → `pq.write_table(snappy)`): il master non
+   tiene mai l'intero dataset in RAM. Rimosso il vecchio dump single-file
+   `f.read()` + broadcast via `client.run` (ogni worker si copiava TUTTO il
+   parquet).
+3. Ogni shard scatterato a UN worker round-robin (`client.scatter(bytes)`):
+   nessun worker tiene l'intero dataset, nessuna copia su disco dei worker.
+4. **Preprocessing in due passate sui worker** (stessa semantica della
+   pipeline ddf precedente: drop `protocol_type/service/flag/label`,
+   `to_numeric(errors="coerce")`, `dropna`, drop colonne costanti via
+   min==max globali; standardizzazione con std campionaria ddof=1):
+   - pass 1: statistiche ridotte per shard (count/sum/sumsq/min/max) →
+     medie/std/min/max globali + colonne costanti;
+   - pass 2: matrice standardizzata `(m_i, d)` per shard.
+5. Ritorna `(X_da, (mean_series, std_series))` dove `X_da` è una
+   `dask.array` `(n, d)` **con shape nota** (le conte per shard arrivano
+   dalla passata 1): un chunk = matrice per shard, quindi `.shape`,
+   `.nbytes`, slicing e riduzioni dask funzionano lato notebook.
+6. `array_to_bag` → `array_to_dask` (stesso formato: un chunk 2D per
+   partizione).
+
+Note d'implementazione (insidie dask verificate in locale):
+
+- `da.from_delayed` non accetta liste: ogni shard va avvolto singolarmente e
+  poi `da.concatenate(axis=0)` (helper `_delayed_matrices_to_array`).
+- Le shape dei chunk DEVONO essere note: con `(np.nan, d)` dask tratta i
+  chunk sconosciuti come grandezza 1 in concatenate/slicing → risultati
+  silenziosamente sbagliati.
+- `Array.to_delayed()` ritorna un **ndarray annidato sulla griglia dei
+  chunk**, non una lista piatta come bag/dataframe: va appiattito con
+  `.ravel().tolist()` prima di consumarlo.
+- `_count_lines_gz` apre con `newline="\n"`: in modalità default su file con
+  fine riga `\r\n` (Windows) conta le righe il doppio → metà shard scritti.
+  Sul cluster Linux non si manifestava; fix per robustezza.
+
+### `src/kmeans_parallel.py`
+
+- `_bag_to_matrices` generalizzata: accetta `dask.array` (chunk 2D usati tal
+  quali, lista appiattita) oppure bag di righe (backward-compat per
+  `agents/smoke_test.py`).
+- Rimosso print di debug in `_update_state`.
+
+### `src/benchmark.py`
+
+- `RESULTS_DIR` di nuovo relativo (`results/`), non più hardcodato al path
+  del VM.
+- `_build_bag` ritorna una dask.array scatterata (finito il bug `build_bag`
+  NameError); `run_benchmark` materializza `X_arr` lato client UNA volta e
+  ri-scattera per ogni numero di partizioni (niente bag `.repartition()`),
+  cancellando il bag precedente con `client.cancel`.
+- Schema risultati unificato anche sul path di fallimento seeding
+  (`initial_cost`/`final_cost`/`lloyd_time` = None invece di `cost`).
+
+### `src/kmeans_comparison.py`, `src/paper_experiments.py`
+
+- `_materialize_bag` lavora su dask.array (chunk 2D appiattiti, vstack sul
+  client); `array_to_dask` per il GaussMixture. Schema risultati invariato
+  (`cost_seed`/`cost_final`/`n_lloyd_iters`).
+
+### Notebook
+
+- `analysis.ipynb`: celle diagnostiche convertite a riduzioni dask.array
+  (`np.isnan(X).any()`, `X.sum(axis=0)`, `X.partitions[0]`, `.nbytes`);
+  `n_points`/`n_features` ora sono metadati (`X.shape`), zero compute; fix
+  refuso `X_bag.npartitions` → `X_bag_full.npartitions`.
+- `comparison.ipynb`, `paper_reproduction.ipynb`, `run.ipynb`: `PARQUET_PATH`
+  → directory shard, import `array_to_dask`.
+
+Compatibilità: i risultati KDD a seed fisso cambiano leggermente (i confini
+di partizione non sono più quelli del bag), la regression golden sintetica
+non cambia. Validato in locale: e2e con `distributed.Client(processes=False)`
+su dataset sintetico schema-KDD (sharding 4 shard, drop costante, 800 punti
+ricostruiti, `run_single_test`/`run_benchmark`/`run_comparison` verdi) +
+smoke test (determinismo e golden OK).
+
+## 2026-09-09 — Pulizia per la consegna: traduzione commenti, ripristino pipeline, notebook allineati
+
+Preparazione del repository per la consegna al docente sul ramo
+`ship-ready` (derivato da `repo-reorganization`). Tre commit:
+
+### Restore della pipeline shard (`605c67d`)
+
+Il commit `fb45ed6` ("small change for random init") aveva **rivertito per
+sbaglio** l'intero refactor 2026-08-30. Ripristinati `src/data_loader.py`,
+`src/kmeans_parallel.py`, `src/benchmark.py`, `src/kmeans_comparison.py`,
+`src/paper_experiments.py` fondendo il refactor con le fix successive
+dell'engine (pairwise argmin chunked, persist nei loop, tol relativa,
+baseline r=0). Rimosso il parametro `parquet_path_workers`, mai esistito
+nella pipeline shard. Commenti e docstring tradotti in inglese.
+Validazione: `agents/smoke_test.py` verde con regression golden
+bit-identica; nuovo `agents/loader_test.py` (gitignored) valida la
+pipeline shard in locale (cache shard, standardizzazione, `run_single_test`
+su dask.array, equivalenza bag↔array in fit).
+
+### Traduzione in inglese (`17464a0`)
+
+`src/launch_cluster.py`, `src/benchmark_analysis.py`,
+`scripts/check_cluster_env.py`, `scripts/sync_workers.py`: docstring e
+commenti passati all'inglese. Nessun cambiamento di comportamento.
+
+### Notebook (`3147d7e`)
+
+- Rimossi i `parquet_path_workers=...` da ogni `load_dataset()`;
+  `PARQUET_PATH` ora punta alle directory di shard
+  (`/tmp/kddcup_data_shards`, `/tmp/kddcup_data_full_shards`).
+- `analysis.ipynb`: celle diagnostiche 20-27 su API dask.array,
+  `import dask.array as da`, `RESULTS_DIR` importato da `src.benchmark`.
+- `paper_reproduction.ipynb`: `array_to_bag` → `array_to_dask`; fix
+  chiamate posizionali `load_dataset` che duplicavano `PARQUET_PATH`.
+- `run.ipynb`: `X_bag_full.take(n)` → `X_bag_full[:n].compute()`.
+- Traduzione in inglese di 36 celle markdown; scrittura markdown corretta
+  (stringa multilinea) per evitare che la normalizzazione nbformat
+  (`clean_notebooks.py`) schiacci le righe — bug scoperto in questa
+  sessione, riparato e verificato.
+- Output rimossi (`agents/clean_notebooks.py --check` verde).
+
+### Docs
+
+`docs/GUIDE.md` riscritto come reference function-level della codebase
+allineata alla pipeline shard; `docs/CHANGES.md` ripristinato (questa
+voce), `README.md`/`TODO.md`/`CODE_REVIEW.md`/`ANALYSIS_PLAN.md`/
+`AGENTS.md` aggiornati ai nomi/fatti correnti (`array_to_dask`,
+directory di shard, determinismo risolto).
+
 ## 2026-08-24 — Incidente cluster: worker senza freeze → KilledWorker. Causa, fix, prevenzione
 
 ### Catena causale completa

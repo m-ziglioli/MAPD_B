@@ -20,17 +20,18 @@ from `notebooks/analysis.ipynb`:
    returns `(cluster, client)`.
 2. **Data ingestion** — `src.data_loader.load_dataset()`:
    - downloads KDD Cup 1999 (`.gz`, full or 10%),
-   - streams it chunk-wise into a single snappy Parquet file (never loads
-     the whole CSV in memory),
-   - `client.run()`s the Parquet bytes onto every worker's local disk at
-     the same absolute path,
-   - opens it with `dd.read_parquet(..., split_row_groups=True)`,
-     drops the 3 categorical columns and `label`, drops constant columns,
-     standardizes with global mean/std (computed in two lazy passes),
-   - returns a **Dask Bag of 1-D NumPy arrays** (one row per element) plus
-     the `(mean, std)` used for scaling.
+   - streams it chunk-wise into **N snappy Parquet shards** (never loads
+     the whole CSV in RAM on the master),
+   - `client.scatter()`s each shard to **one worker** round-robin (no
+     worker holds the whole dataset, nothing copied to worker disks),
+   - preprocesses on the workers in **two passes**: pass 1 computes
+     per-shard statistics → global mean/std/min/max + constant columns;
+     pass 2 drops the 3 categorical columns and `label`, drops constant
+     columns, standardizes with the global sample std (ddof=1),
+   - returns a **`dask.array` `(n, d)` with known chunk shapes** (one 2-D
+     chunk per shard), plus the `(mean, std)` Series used for scaling.
 3. **k-means|| + Lloyd's** — `src.kmeans_parallel.kmeans_parallel`:
-    - `compute_starting_centroids(X_bag, seed, ...)`: Algorithm 2 of the
+    - `compute_starting_centroids(X, seed, ...)`: Algorithm 2 of the
       paper. Uniform initial center; per round, each point is sampled with
       Bernoulli probability `min(1, l*d2(x,C)/phi_X(C))`; a per-partition
       "state" matrix `(m, 2)` of `(min_d2, nearest_center_idx)` is chained
@@ -39,7 +40,7 @@ from `notebooks/analysis.ipynb`:
       recorded in `n_rounds_` / CSV column `r_effective`) the candidate
       pool is reclustered to `k` centers with a weighted scikit-learn KMeans
       (n_init=1, k-means++ init) on the client.
-    - `fit(X_bag, ...)`: distributed Lloyd's on persisted partition
+    - `fit(X, ...)`: distributed Lloyd's on persisted partition
       matrices. Each iteration runs one vectorized task per partition that
       returns only small reductions (`k×d` sums, counts, cost,
       label-changed count); the per-point labels stay in the task graph as
@@ -118,11 +119,13 @@ fit 1.24s → 0.04s, inertia 0.62s → 0.02s (~30x); final cost unchanged
 (672313.9799) and golden regression bit-identical on fixed starting
 centroids (`agents/fixtures/`).
 
-**Still open (structural)**: represent the dataset as a **Dask Array**
-`(n, d)` blocked by rows (or keep the parquet as a Dask DataFrame) and do
-Lloyd's with array ops. After the partition refactor this is now a
-representation change only, not a complexity change — deferred, together
-with the out-of-core loader, to the dedicated next phase.
+**Still open (structural)**: `run_benchmark` gathers the full dataset
+client-side once to re-scatter per partition count. Fine for ≤ full KDD
+(~1.3 GB float64); fully out-of-core re-partitioning within the task graph
+remains deferred (see `docs/TODO.md`). The Dask Array representation itself
+is **implemented** since 2026-08-30: `data_loader` returns a `dask.array`
+`(n, d)` with one 2-D chunk per shard, and the engine consumes it directly
+(`_bag_to_matrices` handles arrays or the legacy bag).
 
 ### Correctness / robustness caveats
 
@@ -148,7 +151,8 @@ with the out-of-core loader, to the dedicated next phase.
 6. **`run_benchmark` materializes the full dataset client-side** once to
    re-scatter per partition count. Fine for <= full KDD (~1.3 GB float64);
    STILL OPEN — moves to the out-of-core phase (together with conditional
-   `persist` and per-worker sharding).
+   `persist`). Per-worker Parquet sharding itself is **DONE** since
+   2026-08-30 (see Part 1 step 2).
 
 ### Review round 2 (2026-08-23, commits `835dfb9` + `cf17263`) — all RESOLVED
 
@@ -205,7 +209,7 @@ Reference: `docs/1203.6402v1.pdf`. Partition baseline excluded per plan.
 
 New work status (from the original gap list):
 
-1. ~~`make_gauss_mission` / Spam loader~~ — GaussMixture DONE (`data_loader.make_gauss_mixture`, `array_to_bag`); Spam dropped by scope decision.
+1. ~~`make_gauss_mission` / Spam loader~~ — GaussMixture DONE (`data_loader.make_gauss_mixture`, `array_to_dask`); Spam dropped by scope decision.
 2. ~~sampling modes / r=0 / iteration count~~ — ALL DONE (`sampling="bernoulli"|"exact"`, r=0 random baseline under policy="fixed", `n_iter_` + `n_rounds_`).
 3. ~~sweep drivers + plotting~~ — DONE (`src/paper_experiments.py`: run_fig51/fig52/table34, plot_fig51/fig52, table34_cost/time tables; known pool<k failures handled benignly for overnight robustness).
 4. Notebook skeleton DONE (`notebooks/paper_reproduction.ipynb`, flag-gated sections). Remaining: EXECUTION on the SSH cluster (sessions A/B of ANALYSIS_PLAN) after B0/B1 validation passes.

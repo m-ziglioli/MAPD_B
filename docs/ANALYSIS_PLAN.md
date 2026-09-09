@@ -3,7 +3,7 @@
 **Status: PREREQUISITES IMPLEMENTED, EXECUTION PENDING** (2026-08-23).
 All "Code prerequisites" below are done and locally validated
 (`src/paper_experiments.py`, `sampling="exact"`, r=0 random baseline,
-`make_gauss_mixture`/`array_to_bag`, `notebooks/paper_reproduction.ipynb`;
+`make_gauss_mixture`/`array_to_dask`, `notebooks/paper_reproduction.ipynb`;
 see CHANGES.md). What remains are the cluster sessions in "Execution
 phases" (after B0 checklist + B1 validation) and the out-of-core item in
 "Deferred separately". Original decisions preserved below. Reference paper:
@@ -30,7 +30,8 @@ pending (Spam dropped).
 1. `src/data_loader.py`:
    - `make_gauss_mixture(n, k, d=15, R, seed)` — k centers ~ N(0, R·I_d),
      points ~ N(center, I_d) with equal weights;
-   - `array_to_bag(X, n_partitions)` — local numpy → Bag of 1-D rows.
+   - `array_to_dask(X, n_partitions)` — local numpy → `dask.array`
+      with `n_partitions` 2-D chunks (same format as `load_dataset`).
 2. `src/kmeans_parallel.py`:
    - `sampling="bernoulli"|"exact"` in `compute_starting_centroids`
      (exact = per round, sample exactly ℓ points without replacement with
@@ -73,6 +74,8 @@ pending (Spam dropped).
 ## Deferred separately (not part of this plan)
 
 - Larger-than-memory (out-of-core) capability: partitioned Parquet dataset
-  + per-worker shards instead of replicas, conditional persist, no
-  client-side materialization in `run_benchmark`. Decided 2026-08-23 to do
-  as its own phase with its own benchmarks.
+  + per-worker shards instead of replicas (partially DONE 2026-08-30:
+  shards are scattered one per worker and the loader is bounded-memory;
+  what remains is conditional persist and no client-side materialization
+  in `run_benchmark`). Decided 2026-08-23 to do as its own phase with its
+  own benchmarks.
