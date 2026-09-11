@@ -1,11 +1,6 @@
 """
 sync_workers.py
-===============
-Deploy ``src/`` + ``requirements.txt`` + a .pth file to ALL the cluster
-workers (see docs/CHANGES.md 2026-08-24).
 
-Why it is needed
-----------------
 The workers are VMs separate from the head and do NOT have the repo:
 without this step, tasks serialized by-reference cannot resolve
 ``import src`` on the worker (and the import chain of src.kmeans_parallel
