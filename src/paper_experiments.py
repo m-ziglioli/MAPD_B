@@ -376,3 +376,88 @@ def table34_time_table(results, stat="median"):
     grouped = df.groupby(["label", "k"])[["time_seed", "time_fit"]].agg(stat)
     grouped["time_total"] = grouped["time_seed"] + grouped["time_fit"]
     return grouped
+
+# ---------------------------------------------------------------------------
+# Cost / running time vs l/k — KDD 10% sample, r fixed
+# (figura extra, non nell'articolo: stesso protocollo di seeding di Table 3/4)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Cost / running time vs l/k — KDD 10% sample, r fixed
+# (figura extra, non nell'articolo: stesso protocollo di seeding di Table 3/4)
+# ---------------------------------------------------------------------------
+
+def run_l_sweep(client, X_bag, k_values=(500, 1000),
+                l_over_k_values=(0.1, 0.2, 0.5, 1, 2, 5), r_fixed=5,
+                n_runs=11, seed=42, max_iter_fit=100, tol=1e-4,
+                num_partitions=64, label="l_sweep", policy="fixed"):
+    """Final cost and total running time vs the oversampling factor l/k, at
+    fixed r, on whatever bag is passed (meant for the 10% KDDCup1999 sample).
+
+    Default seeding protocol as Table 3/4: policy="fixed" (exactly ``r_fixed``
+    rounds, the l/k<=0.1 -> 15 auto rule is NOT applied). Pass policy="auto"
+    to enable the adaptive round rule instead. One row per run;
+    the mean/std aggregation is done at plot time by ``plot_l_sweep``.
+    ``client`` is kept for signature symmetry with the other run_* helpers;
+    the bag is already distributed by the caller.
+    """
+    rows = []
+    for k in k_values:
+        for l_over_k in l_over_k_values:
+            l = max(1, round(l_over_k * k))
+            for i in range(n_runs):
+                res = _run_one_parallel(X_bag, k, l, r_fixed, seed + i,
+                                        policy=policy, sampling="bernoulli",
+                                        max_iter_fit=max_iter_fit, tol=tol)
+                rows.append({
+                    "artifact": "l_sweep",
+                    "method": "kmeans||",
+                    "k": k, "l": l, "r": r_fixed, "l_over_k": l_over_k,
+                    "partitions": num_partitions, "sampling": "bernoulli",
+                    "run": i, "seed": seed + i,
+                    **res,
+                })
+            print(f"[l_sweep] k={k}, l={l} (l/k={l_over_k:g}), r={r_fixed}: "
+                  f"{n_runs} runs done")
+    df = pd.DataFrame(rows)
+    df["time_total"] = df["time_seed"] + df["time_fit"]
+    return df
+
+    
+def plot_l_sweep(results, output_dir="figures", dpi=150):
+    """One figure per k: final cost (left) and total running time (right)
+    vs l/k, mean +/- std over the runs. ``results`` is a DataFrame or a CSV
+    path (as produced by ``run_l_sweep``). Returns the list of saved paths."""
+    df = _load_csv(results) if isinstance(results, str) else results.copy()
+    if "artifact" in df.columns:
+        df = df[df["artifact"] == "l_sweep"]
+    if "failed" in df.columns:
+        df = df[df["failed"] == False]  # noqa: E712 (pandas mask)
+    if "time_total" not in df.columns:
+        df = df.assign(time_total=df["time_seed"] + df["time_fit"])
+
+    metrics = [("cost_final", "Cost"), ("time_total", "Time (s)")]
+    colors = {"cost_final": "tab:blue", "time_total": "tab:orange"}
+    outpaths = []
+    for k in sorted(df["k"].unique()):
+        g = (df[df["k"] == k]
+             .groupby("l_over_k")[["cost_final", "time_total"]]
+             .agg(["mean", "std"]))
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.6))
+        for ax, (col, ylab) in zip(axes, metrics):
+            ax.errorbar(g.index, g[(col, "mean")], yerr=g[(col, "std")],
+                        marker="o", capsize=4, color=colors[col])
+            ax.set_xlabel(r"$\ell\,/\,k$")
+            ax.set_ylabel(f"{ylab} (mean $\\pm$ std)")
+            ax.set_title(f"{ylab.split(' (')[0]} vs $\\ell/k$  ($k={k}$)")
+            ax.grid(True, alpha=0.3)
+        fig.suptitle(f"Cost and running time vs oversampling factor "
+                     f"$\\ell/k$  ($k = {k}$)", fontweight="bold")
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        outpath = os.path.join(output_dir, f"l_sweep_k{k}.png")
+        fig.savefig(outpath, dpi=dpi)
+        plt.close(fig)
+        print("Saved", outpath)
+        outpaths.append(outpath)
+    return outpaths

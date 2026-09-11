@@ -137,7 +137,7 @@ def make_gauss_mixture(n, k, d=15, R=1.0, seed=None):
     Ritorna (X (n,d) float64, y (n,) label, centers (k,d)).
     """
     rng = np.random.default_rng(seed)
-    centers = rng.normal(0.0, float(R), size=(k, d))
+    centers = rng.normal(0.0, np.sqrt(float(R)), size=(k, d))
     y = rng.integers(0, k, size=n)
     X = centers[y] + rng.normal(0.0, 1.0, size=(n, d))
     return X.astype(np.float64), y.astype(np.int64), centers
