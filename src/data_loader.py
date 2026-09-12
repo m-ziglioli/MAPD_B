@@ -30,6 +30,7 @@ import os
 import io
 import gzip
 import urllib.request
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -134,7 +135,8 @@ def _delayed_matrices_to_array(matrix_tasks, row_counts, n_features):
 
 
 def load_dataset(dataset_url, raw_gz_path, parquet_path, col_names,
-                 n_partitions=4, client=None, force_download=False):
+                 n_partitions=4, client=None, force_download=False,
+                 parquet_path_workers=None, **kwargs):
     """
     End-to-end data pipeline, bounded-memory even on the full dataset.
 
@@ -160,6 +162,12 @@ def load_dataset(dataset_url, raw_gz_path, parquet_path, col_names,
         Required: shards are scattered through it.
     force_download : bool
         Re-download the .gz and re-write the shards even if cached.
+    parquet_path_workers : str, optional
+        DEPRECATED, ignored: kept only for backward compatibility with
+        notebooks that still pass it. Workers now receive shards via
+        ``client.scatter`` and never write Parquet to their own disks
+        (see ``docs/CHANGES.md`` 2026-09-09). If supplied, a
+        ``DeprecationWarning`` is emitted and the value is ignored.
 
     Returns
     -------
@@ -168,8 +176,47 @@ def load_dataset(dataset_url, raw_gz_path, parquet_path, col_names,
     (mean, std) : pandas Series
         Global mean/std used for standardization, indexed by feature name.
     """
+    # Backward-compat shim: parquet_path_workers was used by the old
+    # single-file Parquet pipeline (client.run broadcast to worker disks).
+    # The shard pipeline scatters bytes and never uses it; keep the kwarg
+    # so old notebook cells that still pass it do not raise TypeError.
+    # It is intentionally ignored (warn once) rather than restored.
+    if parquet_path_workers is not None or "parquet_path_workers" in kwargs:
+        warnings.warn(
+            "parquet_path_workers is deprecated and ignored: shards are now "
+            "scattered via client.scatter, workers never write Parquet to disk",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    # Positional compat: old call was (..., parquet_path, parquet_path_workers, col_names)
+    # If col_names looks like a parquet path string and n_partitions holds the real col_names,
+    # shift them (covers stale positional calls like load_dataset(url, raw, pq, pq_w, cols)
+    # which now maps pq_w->col_names and cols->n_partitions). Keyword calls are unaffected.
+    if isinstance(col_names, (str, bytes)) and isinstance(n_partitions, (list, tuple)):
+        # old: col_names slot holds pq_workers string, n_partitions slot holds real col_names list
+        col_names, n_partitions, parquet_path_workers = n_partitions, 4, None
+        # also shift client/force_download if they were passed positionally after
+        # (heuristic: if client looks like int, it was really n_partitions)
+        if isinstance(client, int) and not isinstance(client, bool):
+            n_partitions = client
+            client = None
+    elif isinstance(col_names, (str, bytes)) and isinstance(parquet_path_workers, (list, tuple)):
+        col_names, parquet_path_workers = parquet_path_workers, None
+
     if client is None:
         raise ValueError("load_dataset requires a Dask client (pass client=client)")
+
+    # Ensure src.* tasks are serializable by value even when the cluster was
+    # started standalone and the notebook only did Client(SCHEDULER_ADDRESS).
+    # _enable_pickle_by_value is client-process local and idempotent; calling
+    # it here makes load_dataset self-contained and avoids ModuleNotFoundError
+    # on workers (see src/launch_cluster.py and docs/CHANGES.md 2026-08-24).
+    try:
+        from src.launch_cluster import _enable_pickle_by_value
+        _enable_pickle_by_value()
+    except Exception:
+        pass  # soft-fail: if cloudpickle missing, let the task error surface normally
+
     os.makedirs(parquet_path, exist_ok=True)
 
     # --- 1. Download the .gz (cached) ---
@@ -201,7 +248,12 @@ def load_dataset(dataset_url, raw_gz_path, parquet_path, col_names,
     delayed_shards = [dask.delayed(fu) for fu in futures]
 
     # --- 4a. Pass 1: global statistics ---
-    stats = dask.compute(*[dask.delayed(_shard_stats)(s) for s in delayed_shards])
+    # Pin compute to the passed client to avoid the default-client trap:
+    # dask.compute without scheduler uses get_client() (most recently created
+    # Client), which may differ from the `client` that owns the scattered
+    # futures when notebooks have created two Client objects. Pinning avoids
+    # "already forgotten" cancellations. See analysis in prior assistant turn.
+    stats = dask.compute(*[dask.delayed(_shard_stats)(s) for s in delayed_shards], scheduler=client)
     counts = [s[0] for s in stats]
     sums = np.vstack([s[1] for s in stats])
     sq_sums = np.vstack([s[2] for s in stats])

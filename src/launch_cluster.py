@@ -105,6 +105,13 @@ def _enable_pickle_by_value():
         )
 
 
+def ensure_pickle_by_value():
+    """Public alias for _enable_pickle_by_value, for use from notebooks or
+    data_loader when the cluster was started standalone (Client(SCHEDULER_ADDRESS)
+    path). Idempotent, soft-failing — safe to call repeatedly."""
+    return _enable_pickle_by_value()
+
+
 def launch_cluster(n_workers: int, block: bool = False, startup_timeout: float = DEFAULT_STARTUP_TIMEOUT):
     """Start the SSHCluster with the first n_workers nodes of WORKER_IPS
     and connect a Client.
