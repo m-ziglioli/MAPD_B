@@ -240,10 +240,23 @@ def load_dataset(dataset_url, raw_gz_path, parquet_path, col_names,
     # The master holds at most one shard in RAM at a time; scattered futures
     # are sticky, so tasks consuming them run where the shard lives. Note:
     # if n_partitions < n_workers some workers receive no shard and stay idle.
+    # Use hash=False and direct scatter to avoid scheduler bottleneck and
+    # Stream is closed errors on large shards (scheduler OOM). See
+    # distributed CommClosedError during scatter.
+    try:
+        workers = list(client.scheduler_info()["workers"])
+    except Exception:
+        workers = []
     futures = []
-    for f in shard_files:
+    for i, f in enumerate(shard_files):
         with open(f, "rb") as fh:
-            futures.append(client.scatter(fh.read()))
+            data = fh.read()
+        if workers:
+            # round-robin, direct to worker to bypass scheduler memory
+            w = workers[i % len(workers)]
+            futures.append(client.scatter(data, workers=w, hash=False, direct=True, broadcast=False))
+        else:
+            futures.append(client.scatter(data, hash=False))
     # Delayed references to the shards already materialized on the workers.
     delayed_shards = [dask.delayed(fu) for fu in futures]
 
