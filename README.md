@@ -86,15 +86,3 @@ Notes:
    averaged over seeds, following Bahmani et al.'s setup).
 4. `paper_reproduction.ipynb`: reproduction of the paper's synthetic and
    full-scale artifacts (Fig 5.1/5.2, Tables 3/4) via `src/paper_experiments.py`.
-
-## Known issues
-
-- Wall-clock times between serial and parallel methods are not directly
-  comparable (different hardware: client vs cluster); cost/inertia is the
-  controlled metric.
-- `run_benchmark` still gathers the full dataset client-side once per run to
-  re-scatter per partition count — fine up to full KDD (~1.3 GB float64);
-  fully out-of-core re-partitioning remains deferred (see `docs/TODO.md`).
-
-See `docs/CHANGES.md` for the full development log and `docs/GUIDE.md` for
-a function-level codebase reference.

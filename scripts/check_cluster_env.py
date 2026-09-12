@@ -3,9 +3,6 @@ check_cluster_env.py
 ====================
 Verify the cluster WORKERS' environment in one shot: the versions of the
 freeze packages (requirements.txt) must match on EVERY node.
-Born from the 2026-08-24 incident (workers re-provisioned without sklearn
--> by-reference import in a task -> process crash -> KilledWorker, see
-docs/CHANGES.md): with this check the problem surfaces in seconds.
 
 Usage (with a Client already active, e.g. inside a notebook on the head VM):
     from scripts.check_cluster_env import check_workers
@@ -38,8 +35,7 @@ def _probe():
 
 
 def check_workers(client):
-    """Probe every worker via client.run (no dependency on get_worker,
-    which is not available in that context). Returns (local, remote) where
+    """Probe every worker via client.run. Returns (local, remote) where
     remote is {worker_address: {pkg: version}}. Prints a table and a
     verdict on differences against the client's environment (the head,
     the freeze reference)."""
