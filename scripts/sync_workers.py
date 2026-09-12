@@ -33,8 +33,8 @@ SSH = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no"]
 SCP = ["scp", "-q", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no"]
 
 IMPORT_CHECK = (
-    "import sklearn, src.kmeans_parallel, src.data_loader, src.benchmark; "
-    "print('OK', sklearn.__version__)"
+    'import sklearn, src.kmeans_parallel, src.data_loader, src.benchmark; '
+    'print("OK", sklearn.__version__)'
 )
 
 
