@@ -255,12 +255,12 @@ def load_dataset(dataset_url, raw_gz_path, parquet_path, col_names,
     delayed_shards = [dask.delayed(fu) for fu in futures]
 
     # --- 4a. Pass 1: global statistics ---
-    # Pin compute to the passed client to avoid the default-client trap:
-    # dask.compute without scheduler uses get_client() (most recently created
-    # Client), which may differ from the `client` that owns the scattered
-    # futures when notebooks have created two Client objects. Pinning avoids
-    # "already forgotten" cancellations. See analysis in prior assistant turn.
-    stats = dask.compute(*[dask.delayed(_shard_stats)(s) for s in delayed_shards], scheduler=client)
+    # Use client.submit/gather directly on scattered Futures (not
+    # dask.delayed(Future) + dask.compute) to preserve Future ownership and
+    # avoid "already forgotten" GC (distributed#3550, scheduler.py:8961).
+    # This was the main bug behind the persistent FutureCancelledError at
+    # analysis.ipynb:30754ce6 even after scheduler=client pin.
+    stats = client.gather([client.submit(_shard_stats, f) for f in futures])
     counts = [s[0] for s in stats]
     sums = np.vstack([s[1] for s in stats])
     sq_sums = np.vstack([s[2] for s in stats])
