@@ -176,11 +176,7 @@ def load_dataset(dataset_url, raw_gz_path, parquet_path, col_names,
     (mean, std) : pandas Series
         Global mean/std used for standardization, indexed by feature name.
     """
-    # Backward-compat shim: parquet_path_workers was used by the old
-    # single-file Parquet pipeline (client.run broadcast to worker disks).
-    # The shard pipeline scatters bytes and never uses it; keep the kwarg
-    # so old notebook cells that still pass it do not raise TypeError.
-    # It is intentionally ignored (warn once) rather than restored.
+
     if parquet_path_workers is not None or "parquet_path_workers" in kwargs:
         warnings.warn(
             "parquet_path_workers is deprecated and ignored: shards are now "
@@ -210,12 +206,12 @@ def load_dataset(dataset_url, raw_gz_path, parquet_path, col_names,
     # started standalone and the notebook only did Client(SCHEDULER_ADDRESS).
     # _enable_pickle_by_value is client-process local and idempotent; calling
     # it here makes load_dataset self-contained and avoids ModuleNotFoundError
-    # on workers (see src/launch_cluster.py and docs/CHANGES.md 2026-08-24).
+    # on workers.
     try:
         from src.launch_cluster import _enable_pickle_by_value
         _enable_pickle_by_value()
     except Exception:
-        pass  # soft-fail: if cloudpickle missing, let the task error surface normally
+        pass  
 
     os.makedirs(parquet_path, exist_ok=True)
 
@@ -257,9 +253,8 @@ def load_dataset(dataset_url, raw_gz_path, parquet_path, col_names,
     # --- 4a. Pass 1: global statistics ---
     # Use client.submit/gather directly on scattered Futures (not
     # dask.delayed(Future) + dask.compute) to preserve Future ownership and
-    # avoid "already forgotten" GC (distributed#3550, scheduler.py:8961).
-    # This was the main bug behind the persistent FutureCancelledError at
-    # analysis.ipynb:30754ce6 even after scheduler=client pin.
+    # avoid "already forgotten" GC.
+
     stats = client.gather([client.submit(_shard_stats, f) for f in futures])
     counts = [s[0] for s in stats]
     sums = np.vstack([s[1] for s in stats])

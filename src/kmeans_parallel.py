@@ -12,14 +12,14 @@ dataset (a ``dask.array`` of 2-D chunks, or a legacy ``dask.bag`` of rows)
 is decomposed into delayed partitions, each stacked into a dense ``(m, d)``
 matrix, and every pass of the algorithm becomes one task per partition
 returning only the required reductions (per-cluster sums, counts, cost,
-changed-label count). Compared to a row-granular approach this eliminates
+changed-label count). This eliminates
 millions of Python calls and any row shuffle: only k x d matrices cross
 partition boundaries.
 
 Seeding is deterministic: every draw (initial centroid, per-round Bernoulli
 sampling, weighted-reclustering random_state) derives from
 ``SeedSequence(seed)``, with one RNG per (partition, round) — the scheduler
-execution order does not influence the result (docs/CHANGES.md 2026-07-19).
+execution order does not influence the result.
 
 Typical usage (from a notebook):
 
@@ -42,8 +42,7 @@ import numpy as np
 
 
 # ----------------------------------------------------------------------------
-# Vectorized per-partition helpers (module-level functions: serializable by
-# the schedulers without complex closures)
+# Vectorized per-partition helpers 
 # ----------------------------------------------------------------------------
 
 def _stack_rows(rows):
@@ -60,8 +59,7 @@ def _bag_to_matrices(X):
 
     A dask.array already has 2-D chunks; note that ``Array.to_delayed()``
     returns a nested ndarray on the chunk grid (unlike bag/dataframe, which
-    return a flat list), so it must be flattened. A bag of rows (backward
-    compatibility, used by agents/smoke_test.py) is stacked with
+    return a flat list), so it must be flattened. A bag of rows is stacked with
     _stack_rows."""
     if isinstance(X, da.Array):
         return list(X.to_delayed().ravel().tolist())
@@ -118,10 +116,9 @@ def _pairwise_d2_argmin_chunked(M, C, chunk_k=100):
 
     Why: the one-shot version (_pairwise_d2) materializes an
     (n_points, n_centroids) matrix per partition. With large k (500-1000)
-    and large partitions this can weigh several GB in memory (e.g. 8
+    and large partitions this can weigh several MB in memory (e.g. 8
     partitions/worker, k=1000, 4M points total: ~1e8 elements per partition
-    pass = 800 MB each, and NumPy temporaries can triple that on multi-core
-    workers) — the cause of past out-of-memory crashes.
+    pass = 800 MB each.
 
     How: centroids are visited in groups ("chunks") of chunk_k at a time.
     For each group we compute distances only towards that group and keep
@@ -537,7 +534,7 @@ class kmeans_parallel():
 
         # Child RNG keys, one per partition: independent by construction.
         # The (partition, round) seeds are pre-derived in bulk with spawn
-        # (deterministic): no shared stream, no entropy tricks.
+        # (deterministic).
         child_seeds = ss_body.spawn(len(parts))
         round_seeds = [child.spawn(n_rounds) for child in child_seeds]
 
@@ -684,7 +681,7 @@ class kmeans_parallel():
         for iteration in range(max_iter):
             iter_start = time.time()
 
-            # Key trade-off: materializing the per-partition labels on the
+            # Materializing the per-partition labels on the
             # workers (memory ~ n_points * 4 bytes) keeps the task graph
             # flat; recomputing them lazily each iteration would instead
             # make the graph grow without bound.

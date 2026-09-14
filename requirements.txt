@@ -1,12 +1,6 @@
 # Canonical environment pins for this project.
 # Matches pip freeze of the cluster VMs (/home/ubuntu/pyvenv, Ubuntu),
-# captured 2026-08-23. The local dev machine uses a dedicated conda env
-# ('mapd-b') created from this exact file, so local runs exercise the same
-# stack as the nodes (dask 2026.6.0, numpy 2.2.6, pyarrow 24.0.0, ...).
-#
-# Recreate locally:
-#   conda create -n mapd-b python=3.13 -y
-#   conda run -n mapd-b python -m pip install -r requirements.txt
+
 anyio==4.14.1
 argon2-cffi==25.1.0
 argon2-cffi-bindings==25.1.0

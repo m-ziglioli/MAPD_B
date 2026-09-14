@@ -30,15 +30,15 @@ All other notebooks (`analysis.ipynb`, `run.ipynb`) and the `docs/` folder are d
 │   ├── benchmark.py                # run_single_test / run_benchmark grid runner
 │   ├── paper_experiments.py        # paper reproduction drivers (Figs. 5.1/5.2, Tables 3/4)
 │   └── launch_cluster.py           # Dask SSHCluster bootstrap
-├── data/                           # raw .gz + Parquet shards (gitignored, regenerable)
-├── results/                        # benchmark CSVs (gitignored, regenerable)
+├── data/                           # raw .gz (gitignored, regenerable)
+├── results/                        # benchmark CSVs 
 ├── figures/                        # committed plots rendered in the final notebook
 ├── scripts/                        # cluster helpers (environment checks, worker sync)
 ├── environment.yml
 └── requirements.txt                # exact freeze of the cluster VMs
 ```
 
-* `data/` and `results/` are never committed — they are recreated locally by `data_loader.load_dataset()` and by the benchmark drivers. `figures/` contains the plots already embedded in the final notebook.
+* `data/` and `results/` are never committed, they are recreated locally by `data_loader.load_dataset()` and by the benchmark drivers. `figures/` contains the plots already embedded in the final notebook.
 
 ---
 
@@ -77,42 +77,18 @@ Key invariants:
 
 ---
 
-## Environment and setup
+## View the final results
 
-Canonical environment is `mapd-b` (Python 3.13), frozen to the cluster VMs (`requirements.txt` header: dask/distributed 2026.6.0, numpy 2.2.6, pandas 2.3.3, pyarrow 24.0.0, scikit-learn 1.7.2, matplotlib 3.10.9, scipy 1.15.3).
-
-```bash
-# create the environment (once)
-conda env create -f environment.yml
-# or equivalently
-conda create -n mapd-b python=3.13 -y
-conda run -n mapd-b python -m pip install -r requirements.txt
-
-conda activate mapd-b
-python -m ipykernel install --user --name mapd-b --display-name "Python (mapd-b)"
-```
-
-Run all notebooks and scripts **from the repository root** so that `import src.*` and the relative `results/` / `figures/` paths resolve correctly:
-
-```bash
-jupyter notebook notebooks/final_analysis.ipynb
-# select kernel: Python (mapd-b)
-```
-
-On the course VMs the notebooks expect `conda run -n mapd-b` and the `mapd-b` Jupyter kernel at `C:\Users\lcdit\anaconda3\Scripts\jupyter.exe` (bare `jupyter` is not on PATH).
-
----
-
-## Running the final notebook
-
-1. Open `notebooks/final_analysis.ipynb` and select the `mapd-b` kernel.
-2. The notebook is fully rendered — figures and Tables 3/4 are visible without re-execution.
-3. To re-execute, a running Dask cluster is required for the KDD sections (the GaussMixture section runs locally). The first code cells handle `launch_cluster` / `load_dataset`; dataset URLs and shard paths (`/home/ubuntu/...`, `/tmp/...`) match the course infrastructure and should be adapted for a different machine.
-
-Outputs are written only to `results/` (CSVs) and `figures/` (PNGs). `data/` is written only by `data_loader`.
+1. Open `notebooks/final_analysis.ipynb`.
+2. The notebook is fully rendered, figures and Tables are visible without re-execution.
 
 ---
 
 ## Reference
 
 Bahmani, Moseley, Vattani, Kumar, Vassilvitskii — *Scalable K-Means++*, VLDB 2012.
+
+## AI use
+
+Generative AI was used throughout this project mainly as a debugging aid: resolving errors in the code, diagnosing failures in the distributed (Dask) pipeline, and working through implementation bottlenecks that came up while developing and running the algorithm on the cluster. All code and results were reviewed, tested, and validated by the team before being included in this report.
+ 
