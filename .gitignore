@@ -1,6 +1,5 @@
 # --- Data & caches (regenerable, never commit) ---
 data/
-results/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
